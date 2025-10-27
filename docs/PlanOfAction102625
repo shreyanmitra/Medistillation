@@ -1,0 +1,6 @@
+1. Implementing the code for at least 2 distillations methods
+2. Creating the training dataset
+3. Creating the benchmarks
+4. Acquire necessary GPUs
+5. Write training / reslts analysis script
+6. Perform the training
