@@ -4,3 +4,21 @@
 4. Acquire necessary GPUs
 5. Write training / reslts analysis script
 6. Perform the training
+
+==
+DUE: Wednesday
+For milestone, 
+--> 2 people for distillation methods (1 for each)
+    Federico will take LogitKD
+    Shreyan will take StandardSFT
+--> 1 person for training dataset
+    Bryan will create the training dataset
+--> 1 person for creating the training script
+    Tim will create training script
+--> 1 person to get GPU resources
+    Bryan will work on getting GPU resources
+
+Other Action Items:
+1. Shreyan will share a guide on how to create the dataset with Bryan
+2. Shreyan will discuss with Tim regarding training script
+===
