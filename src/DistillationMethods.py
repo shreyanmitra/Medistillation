@@ -496,7 +496,7 @@ class ChainOfThoughtDistillation(BaseDistillationMethod):
     :type student_model: class: `nn.Module`
     :param tokenizer: Tokenizer compatible with both models
     :type tokenizer: TokenizerType
-    :param config: Configuration dictionary with optional 'max_new_tokens' (default 512, longer for reasoning), and optional 'cot_prompt' (reasoning instruction prefix)
+    :param config: Configuration dictionary with optional 'max_new_tokens' (default 512), optional 'cot_prompt' (default "Let's think step by step:"), optional 'num_rationales' (default 1, number of diverse reasoning chains per problem), and optional 'sampling_temperature' (default 0.7, for diverse generation when num_rationales > 1)
     :type config: Dict[str, Any]
     """
     
@@ -512,16 +512,22 @@ class ChainOfThoughtDistillation(BaseDistillationMethod):
         super().__init__(teacher_model, student_model, tokenizer, config)
         self.max_new_tokens: int = config.get('max_new_tokens', 512) #Longer default for reasoning chains
         self.cot_prompt: str = config.get('cot_prompt', "Let's think step by step:") #Prompt to elicit reasoning
+        self.num_rationales: int = config.get('num_rationales', 1) #Number of diverse reasoning chains to generate per problem
+        self.sampling_temperature: float = config.get('sampling_temperature', 0.7) #Temperature for diverse rationale generation
         print(f"Initialized {self.get_method_name()}")
         print(f"  → Max new tokens: {self.max_new_tokens}")
         print(f"  → CoT prompt: '{self.cot_prompt}'")
+        print(f"  → Num rationales: {self.num_rationales}")
+        if self.num_rationales > 1:
+            print(f"  → Sampling temperature: {self.sampling_temperature}")
     
     def compute_loss(self, batch: BatchDict) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Compute cross-entropy loss on teacher's chain-of-thought reasoning.
         
-        Generates teacher CoT responses on-the-fly for each batch, then trains student 
-        to reproduce both the reasoning steps and final answer using cross-entropy loss.
+        Generates teacher CoT responses on-the-fly for each batch. If num_rationales > 1,
+        generates multiple diverse reasoning chains per problem to enrich training data,
+        as described in Ho et al. (2023).
         
         :param batch: Input batch containing tokenized input sequences (prompts only)
         :type batch: BatchDict
@@ -532,6 +538,7 @@ class ChainOfThoughtDistillation(BaseDistillationMethod):
         
         input_ids = batch['input_ids']
         attention_mask = batch['attention_mask']
+        batch_size = input_ids.size(0)
         
         # Augment prompts with CoT instruction to elicit reasoning from teacher
         if 'prompts' in batch:
@@ -540,54 +547,72 @@ class ChainOfThoughtDistillation(BaseDistillationMethod):
             input_ids = cot_tokenized['input_ids'].to(self.get_device())
             attention_mask = cot_tokenized['attention_mask'].to(self.get_device())
         
-        # Generate teacher CoT responses on-the-fly (online distillation)
-        with torch.no_grad():
-            full_sequence = self.teacher_model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=False,  # Greedy decoding for consistency
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id
+        # Generate multiple diverse CoT rationales per problem (Fine-tune-CoT approach)
+        all_losses = []
+        all_response_lengths = []
+        
+        for rationale_idx in range(self.num_rationales):
+            # Use sampling for diverse rationales (if num_rationales > 1), greedy otherwise
+            do_sample = self.num_rationales > 1
+            temperature = self.sampling_temperature if do_sample else 1.0
+            
+            # Generate teacher CoT responses on-the-fly (online distillation)
+            with torch.no_grad():
+                full_sequence = self.teacher_model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=self.max_new_tokens,
+                    do_sample=do_sample,
+                    temperature=temperature if do_sample else None,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id
+                )
+                
+                # Calculate where prompt ends and response begins
+                prompt_length = input_ids.size(1)
+                response_length = full_sequence.size(1) - prompt_length
+                
+                # Create labels: -100 for prompt tokens (ignored in loss), actual tokens for CoT response
+                labels = torch.full_like(full_sequence, -100)
+                labels[:, prompt_length:] = full_sequence[:, prompt_length:]
+                
+                # Store labels from first rationale in batch for external inspection/logging
+                if rationale_idx == 0:
+                    batch['labels'] = labels
+                
+                # Create attention mask for full sequence (preserve original padding info)
+                full_attention_mask = torch.cat([
+                    attention_mask,  # Preserve original prompt mask (including padding)
+                    torch.ones(
+                        (attention_mask.size(0), response_length),
+                        dtype=attention_mask.dtype,
+                        device=attention_mask.device
+                    )  # All 1s for generated tokens (no padding in generation)
+                ], dim=1)
+            
+            # Student forward pass with teacher-generated CoT labels gives us logits and loss
+            student_outputs = self.student_model(
+                input_ids=full_sequence,
+                attention_mask=full_attention_mask,
+                labels=labels
             )
             
-            # Calculate where prompt ends and response begins
-            prompt_length = input_ids.size(1)
-            response_length = full_sequence.size(1) - prompt_length
-            
-            # Create labels: -100 for prompt tokens (ignored in loss), actual tokens for CoT response
-            labels = torch.full_like(full_sequence, -100)
-            labels[:, prompt_length:] = full_sequence[:, prompt_length:]
-            
-            # Store labels in batch for external inspection/logging
-            batch['labels'] = labels
-            
-            # Create attention mask for full sequence (preserve original padding info)
-            full_attention_mask = torch.cat([
-                attention_mask,  # Preserve original prompt mask (including padding)
-                torch.ones(
-                    (attention_mask.size(0), response_length),
-                    dtype=attention_mask.dtype,
-                    device=attention_mask.device
-                )  # All 1s for generated tokens (no padding in generation)
-            ], dim=1)
+            loss = student_outputs.loss #Get cross-entropy loss on reasoning chain
+            all_losses.append(loss)
+            all_response_lengths.append(float(response_length))
         
-        # Student forward pass with teacher-generated CoT labels gives us logits and loss
-        student_outputs = self.student_model(
-            input_ids=full_sequence,
-            attention_mask=full_attention_mask,
-            labels=labels
-        )
-        
-        loss = student_outputs.loss #Get cross-entropy loss on reasoning chain
+        # Average loss across all rationales
+        total_loss = torch.stack(all_losses).mean()
+        avg_response_length = sum(all_response_lengths) / len(all_response_lengths)
         
         metrics = {
-            'ce_loss': loss.item(),
-            'total_loss': loss.item(),
-            'avg_response_length': float(response_length)
+            'ce_loss': total_loss.item(),
+            'total_loss': total_loss.item(),
+            'avg_response_length': avg_response_length,
+            'num_rationales': self.num_rationales
         }
         
-        return loss, metrics
+        return total_loss, metrics
     
     def get_method_name(self) -> str:
         """
@@ -605,35 +630,36 @@ class ChainOfThoughtDistillation(BaseDistillationMethod):
 
 class DirectPreferenceOptimization(BaseDistillationMethod):
     """
-    Direct Preference Optimization (DPO) for preference-based distillation.
+    Direct Preference Optimization (DPO) for preference-based alignment.
     
-    Trains student to prefer teacher-preferred responses over dispreferred ones without 
-    requiring explicit reward models. Uses contrastive learning with preferred (teacher) 
-    and dispreferred (student or alternative) response pairs.
+    Trains student model using pre-collected preference pairs (preferred vs dispreferred responses)
+    without requiring explicit reward models. Uses a simple classification-style loss that directly
+    optimizes the policy to prefer better responses.
     
-    Operates in online mode: teacher generates preferred responses and student generates 
-    dispreferred responses during training. Optimizes student to increase likelihood of 
-    preferred responses relative to dispreferred ones.
+    Unlike RLHF, DPO does NOT use reinforcement learning or sample during training. Instead, it
+    operates on fixed preference pairs and uses a closed-form solution derived from the
+    Bradley-Terry preference model.
     
     **Reference**:
     Rafailov, R., Sharma, A., Mitchell, E., et al. (2023).
     "Direct Preference Optimization: Your Language Model is Secretly a Reward Model"
     https://arxiv.org/abs/2305.18290
 
-    :param teacher_model: Pre-trained teacher model (generates preferred responses)
+    :param teacher_model: Used as reference model (typically the initial/SFT model, often same as student initially)
     :type teacher_model: class: `nn.Module`
-    :param student_model: Student model to be trained
+    :param student_model: Policy model to be trained/aligned
     :type student_model: class: `nn.Module`
     :param tokenizer: Tokenizer compatible with both models
     :type tokenizer: TokenizerType
-    :param config: Configuration dictionary with 'beta' (DPO temperature, default 0.1), optional 'max_new_tokens' (default 256), and optional 'reference_free' (whether to use student as reference, default True)
+    :param config: Configuration dictionary with 'beta' (DPO temperature, default 0.1), controls strength of KL regularization
     :type config: Dict[str, Any]
     :raises ValueError: If beta <= 0
+    
+    Note: This implementation expects batches to contain 'preferred_ids', 'preferred_mask', 
+    'dispreferred_ids', 'dispreferred_mask' instead of generating responses on-the-fly.
     """
     
     beta: float
-    max_new_tokens: int
-    reference_free: bool
     
     def __init__(
         self,
@@ -646,122 +672,126 @@ class DirectPreferenceOptimization(BaseDistillationMethod):
         """
         super().__init__(teacher_model, student_model, tokenizer, config)
         
-        self.beta: float = config.get('beta', 0.1) #DPO temperature parameter
+        self.beta: float = config.get('beta', 0.1) #DPO temperature parameter (KL regularization strength)
         if self.beta <= 0:
             raise ValueError(f"Beta must be > 0, got {self.beta}")
         
-        self.max_new_tokens: int = config.get('max_new_tokens', 256)
-        self.reference_free: bool = config.get('reference_free', True) #Use student as reference
-        
         print(f"Initialized {self.get_method_name()}")
         print(f"  → Beta (β) = {self.beta}")
-        print(f"  → Max new tokens: {self.max_new_tokens}")
-        print(f"  → Reference-free: {self.reference_free}")
+        print(f"  → Note: Requires preference pairs in batch data")
+        print(f"  → Batch must contain: preferred_ids, preferred_mask, dispreferred_ids, dispreferred_mask")
     
     def compute_loss(self, batch: BatchDict) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        Compute DPO loss using preferred (teacher) vs dispreferred (student) responses.
+        Compute DPO loss using pre-collected preference pairs.
         
-        Generates both teacher (preferred) and student (dispreferred) responses on-the-fly,
-        then computes DPO loss to increase relative likelihood of preferred responses.
+        Expects batch to contain both preferred and dispreferred response pairs.
+        Computes log probabilities under policy (student) and reference (teacher) models,
+        then optimizes the policy to increase probability of preferred responses relative
+        to dispreferred ones using the DPO objective.
         
-        :param batch: Input batch containing tokenized input sequences (prompts only)
-        :type batch: BatchDict
-        :returns: Tuple of (DPO loss tensor, metrics dictionary with preference margins)
+        DPO Loss: -log(σ(β * (log π_θ(y_w|x) - log π_θ(y_l|x) - log π_ref(y_w|x) + log π_ref(y_l|x))))
+        where y_w is preferred (chosen), y_l is dispreferred (rejected)
+        
+        :param batch: Input batch containing preference pairs. Must have keys:
+            - 'preferred_ids': Tokenized preferred completions (prompt + response) [batch, seq_len_w]
+            - 'preferred_mask': Attention mask for preferred [batch, seq_len_w]
+            - 'dispreferred_ids': Tokenized dispreferred completions [batch, seq_len_l]
+            - 'dispreferred_mask': Attention mask for dispreferred [batch, seq_len_l]
+            - 'prompt_lengths': Length of prompt for each example [batch] (to mask prompt in loss)
+        :type batch: BatchDict (extended with preference-specific keys)
+        :returns: Tuple of (DPO loss tensor, metrics dictionary)
         :rtype: Tuple[torch.Tensor, Dict[str, float]]
         """
         batch = self.prepare_batch(batch) #Bring everything to same device
         
-        input_ids = batch['input_ids']
-        attention_mask = batch['attention_mask']
-        
-        # Generate preferred responses from teacher (online distillation)
-        with torch.no_grad():
-            preferred_sequence = self.teacher_model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=False,  # Greedy decoding for consistency
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id
+        # Extract preference pair data from batch
+        if 'preferred_ids' not in batch or 'dispreferred_ids' not in batch:
+            raise ValueError(
+                "DPO requires preference pairs in batch. "
+                "Batch must contain: 'preferred_ids', 'preferred_mask', 'dispreferred_ids', 'dispreferred_mask', 'prompt_lengths'"
             )
+        
+        preferred_ids = batch['preferred_ids']  # [batch, seq_len_w]
+        preferred_mask = batch['preferred_mask']  # [batch, seq_len_w]
+        dispreferred_ids = batch['dispreferred_ids']  # [batch, seq_len_l]
+        dispreferred_mask = batch['dispreferred_mask']  # [batch, seq_len_l]
+        prompt_lengths = batch.get('prompt_lengths', None)  # [batch]
+        
+        # Helper function to compute per-token log probabilities
+        def get_log_probs(model, input_ids, attention_mask, labels):
+            """Compute log probabilities for the response tokens only"""
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = outputs.logits  # [batch, seq, vocab]
             
-            # Generate dispreferred responses from student (for contrast)
-            dispreferred_sequence = self.student_model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=True,  # Sample to get different responses than teacher
-                temperature=1.0,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id
-            )
+            # Shift for autoregressive: predict next token
+            shift_logits = logits[..., :-1, :].contiguous()  # [batch, seq-1, vocab]
+            shift_labels = labels[..., 1:].contiguous()  # [batch, seq-1]
+            
+            # Compute log probabilities
+            log_probs = F.log_softmax(shift_logits, dim=-1)  # [batch, seq-1, vocab]
+            
+            # Gather log probs of actual tokens
+            per_token_logps = torch.gather(
+                log_probs, 
+                dim=2, 
+                index=shift_labels.unsqueeze(2)
+            ).squeeze(2)  # [batch, seq-1]
+            
+            # Mask out prompt tokens (only compute on response)
+            response_mask = (shift_labels != -100).float()  # [batch, seq-1]
+            
+            # Average log prob over response tokens
+            sequence_logp = (per_token_logps * response_mask).sum(dim=1) / response_mask.sum(dim=1)
+            return sequence_logp
         
-        # Calculate where prompt ends and responses begin
-        prompt_length = input_ids.size(1)
-        preferred_length = preferred_sequence.size(1) - prompt_length
-        dispreferred_length = dispreferred_sequence.size(1) - prompt_length
+        # Create labels (mask prompt with -100)
+        preferred_labels = preferred_ids.clone()
+        dispreferred_labels = dispreferred_ids.clone()
         
-        # Create labels for preferred sequence: -100 for prompt, actual tokens for response
-        preferred_labels = torch.full_like(preferred_sequence, -100)
-        preferred_labels[:, prompt_length:] = preferred_sequence[:, prompt_length:]
+        if prompt_lengths is not None:
+            for i, prompt_len in enumerate(prompt_lengths):
+                preferred_labels[i, :prompt_len] = -100
+                dispreferred_labels[i, :prompt_len] = -100
         
-        # Create labels for dispreferred sequence
-        dispreferred_labels = torch.full_like(dispreferred_sequence, -100)
-        dispreferred_labels[:, prompt_length:] = dispreferred_sequence[:, prompt_length:]
-        
-        # Store preferred labels in batch for external inspection/logging
+        # Store first preferred sequence in batch for inspection
         batch['labels'] = preferred_labels
         
-        # Create attention masks for full sequences
-        preferred_attention_mask = torch.cat([
-            attention_mask,
-            torch.ones(
-                (attention_mask.size(0), preferred_length),
-                dtype=attention_mask.dtype,
-                device=attention_mask.device
-            )
-        ], dim=1)
+        # Compute policy (student) log probs
+        policy_preferred_logps = get_log_probs(self.student_model, preferred_ids, preferred_mask, preferred_labels)
+        policy_dispreferred_logps = get_log_probs(self.student_model, dispreferred_ids, dispreferred_mask, dispreferred_labels)
         
-        dispreferred_attention_mask = torch.cat([
-            attention_mask,
-            torch.ones(
-                (attention_mask.size(0), dispreferred_length),
-                dtype=attention_mask.dtype,
-                device=attention_mask.device
-            )
-        ], dim=1)
+        # Compute reference (teacher) log probs
+        with torch.no_grad():
+            ref_preferred_logps = get_log_probs(self.teacher_model, preferred_ids, preferred_mask, preferred_labels)
+            ref_dispreferred_logps = get_log_probs(self.teacher_model, dispreferred_ids, dispreferred_mask, dispreferred_labels)
         
-        # Student forward pass on preferred sequence
-        preferred_outputs = self.student_model(
-            input_ids=preferred_sequence,
-            attention_mask=preferred_attention_mask,
-            labels=preferred_labels
-        )
-        preferred_logps = -preferred_outputs.loss  # Convert loss to log probability
+        # DPO loss computation
+        # Compute log ratios: log(π_θ/π_ref) for preferred and dispreferred
+        preferred_log_ratio = policy_preferred_logps - ref_preferred_logps
+        dispreferred_log_ratio = policy_dispreferred_logps - ref_dispreferred_logps
         
-        # Student forward pass on dispreferred sequence
-        dispreferred_outputs = self.student_model(
-            input_ids=dispreferred_sequence,
-            attention_mask=dispreferred_attention_mask,
-            labels=dispreferred_labels
-        )
-        dispreferred_logps = -dispreferred_outputs.loss  # Convert loss to log probability
-        
-        # Compute DPO loss: maximize margin between preferred and dispreferred
-        # DPO loss = -log(sigmoid(beta * (preferred_logp - dispreferred_logp)))
-        logits_diff = preferred_logps - dispreferred_logps
+        # DPO objective: -log(σ(β * (log_ratio_preferred - log_ratio_dispreferred)))
+        logits_diff = preferred_log_ratio - dispreferred_log_ratio
         dpo_loss = -F.logsigmoid(self.beta * logits_diff).mean()
         
-        # Calculate preference margin for logging
-        preference_margin = logits_diff.mean().item()
+        # Compute implicit reward (for logging)
+        implicit_reward_preferred = self.beta * preferred_log_ratio
+        implicit_reward_dispreferred = self.beta * dispreferred_log_ratio
+        reward_margin = (implicit_reward_preferred - implicit_reward_dispreferred).mean().item()
+        
+        # Compute accuracy (how often preferred is ranked higher)
+        accuracy = (logits_diff > 0).float().mean().item()
         
         metrics = {
             'dpo_loss': dpo_loss.item(),
             'total_loss': dpo_loss.item(),
-            'preference_margin': preference_margin,
-            'avg_preferred_length': float(preferred_length),
-            'avg_dispreferred_length': float(dispreferred_length)
+            'reward_margin': reward_margin,
+            'accuracy': accuracy,
+            'policy_preferred_logp': policy_preferred_logps.mean().item(),
+            'policy_dispreferred_logp': policy_dispreferred_logps.mean().item(),
+            'ref_preferred_logp': ref_preferred_logps.mean().item(),
+            'ref_dispreferred_logp': ref_dispreferred_logps.mean().item()
         }
         
         return dpo_loss, metrics
@@ -901,8 +931,10 @@ def create_distillation_method(
     :param config: Method-specific configuration dictionary. Required keys vary by method:
         - SFT: optional 'max_new_tokens' (default 256)
         - Logit-KD: 'alpha' (default 0.5), 'temperature' (default 3.0), optional 'max_new_tokens' (default 256)
-        - CoT: optional 'max_new_tokens' (default 512), optional 'cot_prompt' (default "Let's think step by step:")
-        - DPO: 'beta' (default 0.1), optional 'max_new_tokens' (default 256), optional 'reference_free' (default True)
+        - CoT: optional 'max_new_tokens' (default 512), optional 'cot_prompt' (default "Let's think step by step:"),
+               optional 'num_rationales' (default 1), optional 'sampling_temperature' (default 0.7)
+        - DPO: 'beta' (default 0.1). NOTE: DPO requires pre-collected preference pairs in batch
+               (see DirectPreferenceOptimization docstring for batch format)
     :type config: Dict[str, Any]
     :returns: Instantiated distillation method
     :rtype: BaseDistillationMethod
