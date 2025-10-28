@@ -177,6 +177,10 @@ class StandardSFT(BaseDistillationMethod):
     probability distributions. Operates in online mode: teacher generates responses 
     during training for each batch. Serves as baseline for comparison with other 
     distillation methods.
+    
+    **Reference**: Standard supervised learning approach, widely used baseline.
+    See general NLP textbooks or:
+    https://huggingface.co/docs/transformers/en/tasks/language_modeling
 
     :param teacher_model: Pre-trained teacher model (generates labels during training)
     :type teacher_model: class: `nn.Module`
@@ -294,6 +298,11 @@ class LogitKD(BaseDistillationMethod):
     
     Combines KL divergence loss (for matching teacher distributions) with cross-entropy loss
     (for correctness), weighted by alpha parameter. Temperature parameter controls distribution softness.
+    
+    **Reference**: 
+    Hinton, G., Vinyals, O., & Dean, J. (2015). 
+    "Distilling the Knowledge in a Neural Network"
+    https://arxiv.org/abs/1503.02531
 
     :param teacher_model: Pre-trained teacher model to distill from
     :type teacher_model: class: `nn.Module`
@@ -457,8 +466,419 @@ class LogitKD(BaseDistillationMethod):
 
 
 # ==============================================================================
-# UTILITY FUNCTIONS
+# METHOD 3: CHAIN-OF-THOUGHT DISTILLATION (CoT)
 # ==============================================================================
+
+class ChainOfThoughtDistillation(BaseDistillationMethod):
+    """
+    Chain-of-Thought (CoT) Knowledge Distillation using rationale generation.
+    
+    Distills both the teacher's reasoning process (chain-of-thought) and final answers.
+    Teacher generates responses with explicit reasoning steps, and student learns to 
+    replicate both the reasoning process and final conclusions.
+    
+    Operates in online mode: teacher generates CoT responses during training for each batch.
+    Uses cross-entropy loss on the full reasoning chain, encouraging the student to 
+    develop similar step-by-step reasoning capabilities.
+    
+    **Reference**:
+    Ho, N., Schmid, L., & Yun, S. (2023).
+    "Large Language Models Are Reasoning Teachers"
+    https://arxiv.org/abs/2212.10071
+    
+    Wei, J., Wang, X., Schuurmans, D., et al. (2022).
+    "Chain-of-Thought Prompting Elicits Reasoning in Large Language Models"
+    https://arxiv.org/abs/2201.11903
+
+    :param teacher_model: Pre-trained teacher model (generates CoT responses during training)
+    :type teacher_model: class: `nn.Module`
+    :param student_model: Student model to be trained
+    :type student_model: class: `nn.Module`
+    :param tokenizer: Tokenizer compatible with both models
+    :type tokenizer: TokenizerType
+    :param config: Configuration dictionary with optional 'max_new_tokens' (default 512, longer for reasoning), and optional 'cot_prompt' (reasoning instruction prefix)
+    :type config: Dict[str, Any]
+    """
+    
+    def __init__(
+        self,
+        teacher_model: nn.Module,
+        student_model: nn.Module,
+        tokenizer: TokenizerType,
+        config: Dict[str, Any]
+    ) -> None:
+        """Constructor
+        """
+        super().__init__(teacher_model, student_model, tokenizer, config)
+        self.max_new_tokens: int = config.get('max_new_tokens', 512) #Longer default for reasoning chains
+        self.cot_prompt: str = config.get('cot_prompt', "Let's think step by step:") #Prompt to elicit reasoning
+        print(f"Initialized {self.get_method_name()}")
+        print(f"  → Max new tokens: {self.max_new_tokens}")
+        print(f"  → CoT prompt: '{self.cot_prompt}'")
+    
+    def compute_loss(self, batch: BatchDict) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Compute cross-entropy loss on teacher's chain-of-thought reasoning.
+        
+        Generates teacher CoT responses on-the-fly for each batch, then trains student 
+        to reproduce both the reasoning steps and final answer using cross-entropy loss.
+        
+        :param batch: Input batch containing tokenized input sequences (prompts only)
+        :type batch: BatchDict
+        :returns: Tuple of (loss tensor for backpropagation, metrics dictionary)
+        :rtype: Tuple[torch.Tensor, Dict[str, float]]
+        """
+        batch = self.prepare_batch(batch) #Bring everything to the same device
+        
+        input_ids = batch['input_ids']
+        attention_mask = batch['attention_mask']
+        
+        # Augment prompts with CoT instruction to elicit reasoning from teacher
+        if 'prompts' in batch:
+            cot_prompts = [f"{prompt}\n{self.cot_prompt}" for prompt in batch['prompts']]
+            cot_tokenized = self.tokenize_prompts(cot_prompts)
+            input_ids = cot_tokenized['input_ids'].to(self.get_device())
+            attention_mask = cot_tokenized['attention_mask'].to(self.get_device())
+        
+        # Generate teacher CoT responses on-the-fly (online distillation)
+        with torch.no_grad():
+            full_sequence = self.teacher_model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,  # Greedy decoding for consistency
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id
+            )
+            
+            # Calculate where prompt ends and response begins
+            prompt_length = input_ids.size(1)
+            response_length = full_sequence.size(1) - prompt_length
+            
+            # Create labels: -100 for prompt tokens (ignored in loss), actual tokens for CoT response
+            labels = torch.full_like(full_sequence, -100)
+            labels[:, prompt_length:] = full_sequence[:, prompt_length:]
+            
+            # Store labels in batch for external inspection/logging
+            batch['labels'] = labels
+            
+            # Create attention mask for full sequence (preserve original padding info)
+            full_attention_mask = torch.cat([
+                attention_mask,  # Preserve original prompt mask (including padding)
+                torch.ones(
+                    (attention_mask.size(0), response_length),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device
+                )  # All 1s for generated tokens (no padding in generation)
+            ], dim=1)
+        
+        # Student forward pass with teacher-generated CoT labels gives us logits and loss
+        student_outputs = self.student_model(
+            input_ids=full_sequence,
+            attention_mask=full_attention_mask,
+            labels=labels
+        )
+        
+        loss = student_outputs.loss #Get cross-entropy loss on reasoning chain
+        
+        metrics = {
+            'ce_loss': loss.item(),
+            'total_loss': loss.item(),
+            'avg_response_length': float(response_length)
+        }
+        
+        return loss, metrics
+    
+    def get_method_name(self) -> str:
+        """
+        Return method identifier for logging.
+        
+        :returns: Method name string
+        :rtype: str
+        """
+        return "Chain-of-Thought"
+
+
+# ==============================================================================
+# METHOD 4: DIRECT PREFERENCE OPTIMIZATION (DPO)
+# ==============================================================================
+
+class DirectPreferenceOptimization(BaseDistillationMethod):
+    """
+    Direct Preference Optimization (DPO) for preference-based distillation.
+    
+    Trains student to prefer teacher-preferred responses over dispreferred ones without 
+    requiring explicit reward models. Uses contrastive learning with preferred (teacher) 
+    and dispreferred (student or alternative) response pairs.
+    
+    Operates in online mode: teacher generates preferred responses and student generates 
+    dispreferred responses during training. Optimizes student to increase likelihood of 
+    preferred responses relative to dispreferred ones.
+    
+    **Reference**:
+    Rafailov, R., Sharma, A., Mitchell, E., et al. (2023).
+    "Direct Preference Optimization: Your Language Model is Secretly a Reward Model"
+    https://arxiv.org/abs/2305.18290
+
+    :param teacher_model: Pre-trained teacher model (generates preferred responses)
+    :type teacher_model: class: `nn.Module`
+    :param student_model: Student model to be trained
+    :type student_model: class: `nn.Module`
+    :param tokenizer: Tokenizer compatible with both models
+    :type tokenizer: TokenizerType
+    :param config: Configuration dictionary with 'beta' (DPO temperature, default 0.1), optional 'max_new_tokens' (default 256), and optional 'reference_free' (whether to use student as reference, default True)
+    :type config: Dict[str, Any]
+    :raises ValueError: If beta <= 0
+    """
+    
+    beta: float
+    max_new_tokens: int
+    reference_free: bool
+    
+    def __init__(
+        self,
+        teacher_model: nn.Module,
+        student_model: nn.Module,
+        tokenizer: TokenizerType,
+        config: Dict[str, Any]
+    ) -> None:
+        """Constructor
+        """
+        super().__init__(teacher_model, student_model, tokenizer, config)
+        
+        self.beta: float = config.get('beta', 0.1) #DPO temperature parameter
+        if self.beta <= 0:
+            raise ValueError(f"Beta must be > 0, got {self.beta}")
+        
+        self.max_new_tokens: int = config.get('max_new_tokens', 256)
+        self.reference_free: bool = config.get('reference_free', True) #Use student as reference
+        
+        print(f"Initialized {self.get_method_name()}")
+        print(f"  → Beta (β) = {self.beta}")
+        print(f"  → Max new tokens: {self.max_new_tokens}")
+        print(f"  → Reference-free: {self.reference_free}")
+    
+    def compute_loss(self, batch: BatchDict) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Compute DPO loss using preferred (teacher) vs dispreferred (student) responses.
+        
+        Generates both teacher (preferred) and student (dispreferred) responses on-the-fly,
+        then computes DPO loss to increase relative likelihood of preferred responses.
+        
+        :param batch: Input batch containing tokenized input sequences (prompts only)
+        :type batch: BatchDict
+        :returns: Tuple of (DPO loss tensor, metrics dictionary with preference margins)
+        :rtype: Tuple[torch.Tensor, Dict[str, float]]
+        """
+        batch = self.prepare_batch(batch) #Bring everything to same device
+        
+        input_ids = batch['input_ids']
+        attention_mask = batch['attention_mask']
+        
+        # Generate preferred responses from teacher (online distillation)
+        with torch.no_grad():
+            preferred_sequence = self.teacher_model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,  # Greedy decoding for consistency
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id
+            )
+            
+            # Generate dispreferred responses from student (for contrast)
+            dispreferred_sequence = self.student_model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=True,  # Sample to get different responses than teacher
+                temperature=1.0,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id
+            )
+        
+        # Calculate where prompt ends and responses begin
+        prompt_length = input_ids.size(1)
+        preferred_length = preferred_sequence.size(1) - prompt_length
+        dispreferred_length = dispreferred_sequence.size(1) - prompt_length
+        
+        # Create labels for preferred sequence: -100 for prompt, actual tokens for response
+        preferred_labels = torch.full_like(preferred_sequence, -100)
+        preferred_labels[:, prompt_length:] = preferred_sequence[:, prompt_length:]
+        
+        # Create labels for dispreferred sequence
+        dispreferred_labels = torch.full_like(dispreferred_sequence, -100)
+        dispreferred_labels[:, prompt_length:] = dispreferred_sequence[:, prompt_length:]
+        
+        # Store preferred labels in batch for external inspection/logging
+        batch['labels'] = preferred_labels
+        
+        # Create attention masks for full sequences
+        preferred_attention_mask = torch.cat([
+            attention_mask,
+            torch.ones(
+                (attention_mask.size(0), preferred_length),
+                dtype=attention_mask.dtype,
+                device=attention_mask.device
+            )
+        ], dim=1)
+        
+        dispreferred_attention_mask = torch.cat([
+            attention_mask,
+            torch.ones(
+                (attention_mask.size(0), dispreferred_length),
+                dtype=attention_mask.dtype,
+                device=attention_mask.device
+            )
+        ], dim=1)
+        
+        # Student forward pass on preferred sequence
+        preferred_outputs = self.student_model(
+            input_ids=preferred_sequence,
+            attention_mask=preferred_attention_mask,
+            labels=preferred_labels
+        )
+        preferred_logps = -preferred_outputs.loss  # Convert loss to log probability
+        
+        # Student forward pass on dispreferred sequence
+        dispreferred_outputs = self.student_model(
+            input_ids=dispreferred_sequence,
+            attention_mask=dispreferred_attention_mask,
+            labels=dispreferred_labels
+        )
+        dispreferred_logps = -dispreferred_outputs.loss  # Convert loss to log probability
+        
+        # Compute DPO loss: maximize margin between preferred and dispreferred
+        # DPO loss = -log(sigmoid(beta * (preferred_logp - dispreferred_logp)))
+        logits_diff = preferred_logps - dispreferred_logps
+        dpo_loss = -F.logsigmoid(self.beta * logits_diff).mean()
+        
+        # Calculate preference margin for logging
+        preference_margin = logits_diff.mean().item()
+        
+        metrics = {
+            'dpo_loss': dpo_loss.item(),
+            'total_loss': dpo_loss.item(),
+            'preference_margin': preference_margin,
+            'avg_preferred_length': float(preferred_length),
+            'avg_dispreferred_length': float(dispreferred_length)
+        }
+        
+        return dpo_loss, metrics
+    
+    def get_method_name(self) -> str:
+        """
+        Return method identifier with hyperparameters for logging.
+        
+        :returns: Method name string including beta value
+        :rtype: str
+        """
+        return f"DPO (β={self.beta})"
+
+
+# ==============================================================================
+# FACTORY FUNCTIONS
+# ==============================================================================
+
+def create_custom_distillation_method(
+    method_name: str,
+    compute_loss_fn: callable,
+    teacher_model: nn.Module,
+    student_model: nn.Module,
+    tokenizer: TokenizerType,
+    config: Dict[str, Any]
+) -> BaseDistillationMethod:
+    """
+    Factory function to create a custom distillation method dynamically.
+    
+    Allows users to define their own compute_loss logic without creating a new class.
+    The compute_loss function will have access to self (the distillation method instance).
+    
+    :param method_name: Name for the custom distillation method (for logging)
+    :type method_name: str
+    :param compute_loss_fn: User-defined function with signature:
+        compute_loss_fn(self, batch: BatchDict) -> Tuple[torch.Tensor, Dict[str, float]]
+        The function receives the method instance (self) and batch, returns (loss, metrics).
+    :type compute_loss_fn: callable
+    :param teacher_model: Pre-trained teacher model
+    :type teacher_model: nn.Module
+    :param student_model: Student model to train
+    :type student_model: nn.Module
+    :param tokenizer: Tokenizer compatible with both models
+    :type tokenizer: TokenizerType
+    :param config: Method-specific configuration dictionary (accessible via self.config)
+    :type config: Dict[str, Any]
+    :returns: Custom distillation method instance
+    :rtype: BaseDistillationMethod
+    
+    Example::
+    
+        # Define custom loss function
+        def my_custom_loss(self, batch):
+            batch = self.prepare_batch(batch)
+            
+            # Custom logic here
+            with torch.no_grad():
+                teacher_outputs = self.teacher_model.generate(
+                    input_ids=batch['input_ids'],
+                    attention_mask=batch['attention_mask'],
+                    max_new_tokens=self.config.get('max_new_tokens', 128)
+                )
+            
+            # Your custom loss computation
+            student_outputs = self.student_model(...)
+            loss = my_custom_loss_calculation(student_outputs, teacher_outputs)
+            
+            metrics = {'total_loss': loss.item()}
+            return loss, metrics
+        
+        # Create method
+        custom_method = create_custom_distillation_method(
+            method_name='My-Custom-Method',
+            compute_loss_fn=my_custom_loss,
+            teacher_model=teacher,
+            student_model=student,
+            tokenizer=tokenizer,
+            config={'max_new_tokens': 128, 'custom_param': 0.5}
+        )
+        
+        # Use like any other method
+        loss, metrics = custom_method.compute_loss(batch)
+    """
+    
+    # Dynamically create a class that inherits from BaseDistillationMethod
+    class CustomDistillationMethod(BaseDistillationMethod):
+        def __init__(
+            self,
+            teacher_model: nn.Module,
+            student_model: nn.Module,
+            tokenizer: TokenizerType,
+            config: Dict[str, Any],
+            name: str,
+            loss_fn: callable
+        ):
+            super().__init__(teacher_model, student_model, tokenizer, config)
+            self._method_name = name
+            self._compute_loss_fn = loss_fn
+            print(f"Initialized custom method: {self.get_method_name()}")
+        
+        def compute_loss(self, batch: 'BaseDistillationMethod.BatchDict') -> Tuple[torch.Tensor, Dict[str, float]]:
+            """Calls user-defined compute_loss function"""
+            return self._compute_loss_fn(self, batch)
+        
+        def get_method_name(self) -> str:
+            """Returns user-defined method name"""
+            return self._method_name
+    
+    # Instantiate and return the custom class
+    return CustomDistillationMethod(
+        teacher_model=teacher_model,
+        student_model=student_model,
+        tokenizer=tokenizer,
+        config=config,
+        name=method_name,
+        loss_fn=compute_loss_fn
+    )
 
 def create_distillation_method(
     method_name: str,
@@ -478,22 +898,37 @@ def create_distillation_method(
     :type student_model: nn.Module
     :param tokenizer: Tokenizer compatible with both models
     :type tokenizer: TokenizerType
-    :param config: Method-specific configuration dictionary
+    :param config: Method-specific configuration dictionary. Required keys vary by method:
+        - SFT: optional 'max_new_tokens' (default 256)
+        - Logit-KD: 'alpha' (default 0.5), 'temperature' (default 3.0), optional 'max_new_tokens' (default 256)
+        - CoT: optional 'max_new_tokens' (default 512), optional 'cot_prompt' (default "Let's think step by step:")
+        - DPO: 'beta' (default 0.1), optional 'max_new_tokens' (default 256), optional 'reference_free' (default True)
     :type config: Dict[str, Any]
     :returns: Instantiated distillation method
     :rtype: BaseDistillationMethod
     :raises ValueError: If method_name is not recognized
-    :raises NotImplementedError: If method not yet implemented (CoT, DPO)
     
     Example::
     
-        method = create_distillation_method(
+        # Standard SFT
+        sft = create_distillation_method('sft', teacher, student, tokenizer, {})
+        
+        # Logit-KD with custom hyperparameters
+        logit_kd = create_distillation_method(
             'logit_kd',
             teacher,
             student,
             tokenizer,
             {'alpha': 0.5, 'temperature': 3.0}
         )
+        
+        # Chain-of-Thought
+        cot = create_distillation_method('cot', teacher, student, tokenizer, {})
+        
+        # Direct Preference Optimization
+        dpo = create_distillation_method('dpo', teacher, student, tokenizer, {'beta': 0.1})
+        
+        # Compute loss
         loss, metrics = method.compute_loss(batch)
     """
     method_name = method_name.lower()
@@ -505,51 +940,13 @@ def create_distillation_method(
         return LogitKD(teacher_model, student_model, tokenizer, config)
     
     elif method_name in ('cot', 'chain_of_thought'):
-        raise NotImplementedError("CoT distillation will be implemented in Phase 2")
+        return ChainOfThoughtDistillation(teacher_model, student_model, tokenizer, config)
     
-    elif method_name in ('dpo', 'preference'):
-        raise NotImplementedError("DPO distillation will be implemented in Phase 2")
+    elif method_name in ('dpo', 'preference', 'direct_preference_optimization'):
+        return DirectPreferenceOptimization(teacher_model, student_model, tokenizer, config)
     
     else:
         raise ValueError(
             f"Unknown distillation method: {method_name}. "
             f"Choose from: ['sft', 'logit_kd', 'cot', 'dpo']"
         )
-
-
-# ==============================================================================
-# TESTING / EXAMPLE USAGE
-# ==============================================================================
-
-if __name__ == "__main__":
-    """
-    Module test script demonstrating distillation method instantiation.
-    
-    Run directly to verify imports and class initialization:
-        python src/DistillationMethods.py
-    
-    For actual usage, load real models and pass batches to compute_loss().
-    """
-    print("=" * 60)
-    print("Testing Distillation Methods")
-    print("=" * 60)
-    
-    print("\nNote: Actual model loading commented out to prevent resource usage.")
-    print("Uncomment the following lines to test with real models:\n")
-    
-    print("from transformers import AutoModelForCausalLM, AutoTokenizer")
-    print("teacher = AutoModelForCausalLM.from_pretrained('epfl-llm/meditron-7b')")
-    print("student = AutoModelForCausalLM.from_pretrained('Qwen/Qwen2-1.5B')")
-    print("tokenizer = AutoTokenizer.from_pretrained('Qwen/Qwen2-1.5B')")
-    print("\n# Standard SFT")
-    print("sft = StandardSFT(teacher, student, tokenizer, {})")
-    print("\n# Logit KD with balanced configuration")
-    print("logit_kd = LogitKD(teacher, student, tokenizer, {'alpha': 0.5, 'temperature': 3.0})")
-    print("\n# Using factory function")
-    print("method = create_distillation_method('logit_kd', teacher, student, tokenizer, config)")
-    print("\n# Compute loss")
-    print("loss, metrics = method.compute_loss(batch)")
-    
-    print("\n" + "=" * 60)
-    print("Module structure validated. Import checks passed.")
-    print("=" * 60)
