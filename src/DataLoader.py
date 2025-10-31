@@ -24,12 +24,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class MedicalQADataset(Dataset):
+class MedMcqaDataset(Dataset):
     """
-    Dataset class for medical question-answering data.
+    Dataset class for MedMCQA medical question-answering data.
     
     Supports multiple data formats and can be configured for different distillation methods.
-    Handles both single-choice and multi-choice questions from medical datasets.
+    Handles both single-choice and multi-choice questions from the MedMCQA dataset.
     
     :param data_path: Path to the JSON data file
     :type data_path: str
@@ -271,9 +271,9 @@ class MedicalQADataset(Dataset):
             }
 
 
-class MedicalQACollator:
+class MedMcqaCollator:
     """
-    Collator class for batching medical QA data.
+    Collator class for batching MedMCQA data.
     
     Handles tokenization and batching for different distillation methods.
     Converts raw text data into tensors suitable for model training.
@@ -467,7 +467,7 @@ def create_dataloader(
     :rtype: DataLoader
     """
     # Create dataset
-    dataset = MedicalQADataset(
+    dataset = MedMcqaDataset(
         data_path=data_path,
         tokenizer=tokenizer,
         max_length=max_length,
@@ -476,7 +476,7 @@ def create_dataloader(
     )
     
     # Create collator
-    collator = MedicalQACollator(
+    collator = MedMcqaCollator(
         tokenizer=tokenizer,
         max_length=max_length,
         distillation_method=distillation_method,
@@ -508,15 +508,23 @@ def create_train_val_dataloaders(
         **kwargs
     ) -> Tuple[DataLoader, DataLoader]:
     """
-    Create both training and validation DataLoaders.
+    Create both training and validation DataLoaders for model training.
     
-    :param train_path: Path to training data
+    This function is useful when you have separate training and validation datasets
+    and want to create DataLoaders for both. The validation dataloader is typically
+    used for:
+    - Model evaluation during training
+    - Early stopping based on validation loss
+    - Monitoring overfitting
+    - Computing validation metrics
+    
+    :param train_path: Path to training data (e.g., train_aug.json)
     :type train_path: str
-    :param val_path: Path to validation data
+    :param val_path: Path to validation data (e.g., dev.json)
     :type val_path: str
     :param tokenizer: HuggingFace tokenizer
     :type tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast]
-    :param batch_size: Batch size for training
+    :param batch_size: Batch size for both dataloaders
     :type batch_size: int
     :param max_length: Maximum sequence length
     :type max_length: int
@@ -526,6 +534,31 @@ def create_train_val_dataloaders(
     :type num_workers: int
     :returns: Tuple of (train_dataloader, val_dataloader)
     :rtype: Tuple[DataLoader, DataLoader]
+    
+    Example::
+        # Create train/val dataloaders for SFT training
+        train_dl, val_dl = create_train_val_dataloaders(
+            train_path="augmented_data/augmented_MedMcqa/train_aug.json",
+            val_path="data/MedMcqa_data/dev.json",
+            tokenizer=tokenizer,
+            batch_size=8,
+            distillation_method="sft"
+        )
+        
+        # Use in training loop
+        for epoch in range(num_epochs):
+            # Training
+            for batch in train_dl:
+                loss, metrics = model.compute_loss(batch)
+                # ... training step
+            
+            # Validation
+            val_losses = []
+            for batch in val_dl:
+                with torch.no_grad():
+                    loss, metrics = model.compute_loss(batch)
+                    val_losses.append(loss.item())
+            print(f"Epoch {epoch}, Val Loss: {np.mean(val_losses)}")
     """
     # Create training dataloader
     train_dataloader = create_dataloader(
