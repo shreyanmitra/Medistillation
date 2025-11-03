@@ -3,20 +3,25 @@
 (C) 2025. Bryan Zhao, Federico Baldan, Tim Avilov, and Shreyan Mitra
 Written for CSE 493S: Advanced Topics in Machine Learning Course at the University of Washington, Seattle
 
-Training Script for Medical LLM Distillation
+Training Script for Medical LLM Distillation with Multi-GPU Support
 
 This script orchestrates the complete distillation training pipeline including:
-- Teacher/student model setup
+- Teacher/student model setup with proper device placement
+- Multi-GPU training via HuggingFace Accelerate
 - Dataset preparation
 - Training with selected distillation method
 - Evaluation on medical benchmarks
 - Model persistence and checkpointing
 
 Usage:
+    # Single GPU
     python train_distillation.py --method sft --output_dir ./outputs/sft_run1
-    python train_distillation.py --method logit_kd --alpha 0.5 --temperature 3.0
-    python train_distillation.py --method cot --num_rationales 3
-    python train_distillation.py --method dpo --beta 0.1
+    
+    # Multi-GPU (automatically detects available GPUs)
+    accelerate launch train_distillation.py --method sft --output_dir ./outputs/sft_run1
+    
+    # Multi-GPU with specific configuration
+    accelerate launch --num_processes 4 train_distillation.py --method logit_kd --alpha 0.5
 """
 
 import os
@@ -38,6 +43,7 @@ from transformers import (
     BitsAndBytesConfig
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from tqdm import tqdm
 
 # Import our custom modules
@@ -109,8 +115,8 @@ class TrainingConfig:
         self.logging_steps: int = args.logging_steps
         self.num_workers: int = args.num_workers
 
-        # Device
-        self.device: str = "cuda" if torch.cuda.is_available() else "cpu"
+        # Multi-GPU settings
+        self.mixed_precision: str = args.mixed_precision  # 'no', 'fp16', or 'bf16'
 
         # Create output directories
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
@@ -142,15 +148,21 @@ def setup_quantization_config() -> BitsAndBytesConfig:
 
 def load_teacher_model(
     model_name: str,
-    use_quantization: bool = True
+    use_quantization: bool = True,
+    device: Optional[torch.device] = None
 ) -> nn.Module:
     """
     Load teacher model with optional quantization.
+
+    Note: Teacher is loaded on a specific device (not distributed) since it's only
+    used for inference and doesn't need gradient computation.
 
     :param model_name: HuggingFace model identifier
     :type model_name: str
     :param use_quantization: Whether to use 8-bit quantization
     :type use_quantization: bool
+    :param device: Specific device to load teacher on (for multi-GPU setups)
+    :type device: Optional[torch.device]
     :returns: Loaded teacher model
     :rtype: nn.Module
     """
@@ -158,22 +170,31 @@ def load_teacher_model(
 
     if use_quantization:
         quantization_config = setup_quantization_config()
+        # For quantized models, use device_map to place on specific GPU
+        device_map = {"": device.index if device else 0} if device else "auto"
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             quantization_config=quantization_config,
-            device_map="auto",
+            device_map=device_map,
             trust_remote_code=True
         )
     else:
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            device_map="auto",
             torch_dtype=torch.float16,
             trust_remote_code=True
         )
+        if device:
+            model = model.to(device)
 
     model.eval()
-    logger.info("Teacher model loaded successfully")
+
+    # Freeze teacher parameters
+    for param in model.parameters():
+        param.requires_grad = False
+
+    logger.info(
+        f"Teacher model loaded on device: {next(model.parameters()).device}")
     return model
 
 
@@ -181,10 +202,14 @@ def load_student_model(
     model_name: str,
     use_lora: bool = True,
     lora_config: Optional[Dict[str, Any]] = None,
-    use_quantization: bool = True
+    use_quantization: bool = True,
+    device: Optional[torch.device] = None
 ) -> nn.Module:
     """
     Load student model with optional LoRA adapters.
+
+    Note: Student model will be wrapped by Accelerate for distributed training,
+    so we load it on CPU first and let Accelerate handle device placement.
 
     :param model_name: HuggingFace model identifier
     :type model_name: str
@@ -194,6 +219,8 @@ def load_student_model(
     :type lora_config: Optional[Dict[str, Any]]
     :param use_quantization: Whether to use quantization (QLoRA)
     :type use_quantization: bool
+    :param device: Device to load model on (unused, kept for compatibility)
+    :type device: Optional[torch.device]
     :returns: Loaded student model
     :rtype: nn.Module
     """
@@ -201,17 +228,17 @@ def load_student_model(
 
     if use_quantization:
         quantization_config = setup_quantization_config()
+        # Load on first GPU initially - Accelerate will handle distribution
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             quantization_config=quantization_config,
-            device_map="auto",
+            device_map={"": 0},  # Load on GPU 0, Accelerate will redistribute
             trust_remote_code=True
         )
         model = prepare_model_for_kbit_training(model)
     else:
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            device_map="auto",
             torch_dtype=torch.float16,
             trust_remote_code=True
         )
@@ -230,6 +257,8 @@ def load_student_model(
 
         peft_config = LoraConfig(**lora_config)
         model = get_peft_model(model, peft_config)
+
+        logger.info("LoRA Trainable Parameters:")
         model.print_trainable_parameters()
 
     logger.info("Student model loaded successfully")
@@ -264,9 +293,10 @@ def load_tokenizer(model_name: str) -> AutoTokenizer:
 
 class Trainer:
     """
-    Main training class for distillation methods.
+    Main training class for distillation methods with multi-GPU support.
 
     Handles training loop, evaluation, checkpointing, and logging.
+    Uses HuggingFace Accelerate for seamless multi-GPU training.
     """
 
     def __init__(
@@ -276,7 +306,8 @@ class Trainer:
         train_dataloader: DataLoader,
         val_dataloader: DataLoader,
         optimizer: torch.optim.Optimizer,
-        scheduler: Any
+        scheduler: Any,
+        accelerator: Accelerator
     ):
         """Initialize trainer."""
         self.config = config
@@ -285,6 +316,7 @@ class Trainer:
         self.val_dataloader = val_dataloader
         self.optimizer = optimizer
         self.scheduler = scheduler
+        self.accelerator = accelerator
 
         self.global_step = 0
         self.best_val_loss = float('inf')
@@ -296,19 +328,24 @@ class Trainer:
 
     def train(self):
         """Main training loop."""
-        logger.info("Starting training...")
-        logger.info(f"Method: {self.distillation_method.get_method_name()}")
-        logger.info(f"Total epochs: {self.config.num_epochs}")
-        logger.info(f"Batch size: {self.config.batch_size}")
-        logger.info(
-            f"Gradient accumulation steps: {self.config.gradient_accumulation_steps}")
-        logger.info(
-            f"Effective batch size: {self.config.batch_size * self.config.gradient_accumulation_steps}")
+        # Only log from main process
+        if self.accelerator.is_main_process:
+            logger.info("Starting training...")
+            logger.info(
+                f"Method: {self.distillation_method.get_method_name()}")
+            logger.info(f"Total epochs: {self.config.num_epochs}")
+            logger.info(f"Batch size per device: {self.config.batch_size}")
+            logger.info(f"Number of devices: {self.accelerator.num_processes}")
+            logger.info(
+                f"Gradient accumulation steps: {self.config.gradient_accumulation_steps}")
+            logger.info(
+                f"Effective batch size: {self.config.batch_size * self.config.gradient_accumulation_steps * self.accelerator.num_processes}")
 
         for epoch in range(self.config.num_epochs):
-            logger.info(f"\n{'='*80}")
-            logger.info(f"Epoch {epoch + 1}/{self.config.num_epochs}")
-            logger.info(f"{'='*80}")
+            if self.accelerator.is_main_process:
+                logger.info(f"\n{'='*80}")
+                logger.info(f"Epoch {epoch + 1}/{self.config.num_epochs}")
+                logger.info(f"{'='*80}")
 
             # Training phase
             train_metrics = self.train_epoch(epoch)
@@ -316,22 +353,24 @@ class Trainer:
             # Validation phase
             val_metrics = self.evaluate()
 
-            # Log epoch summary
-            self.log_epoch_summary(epoch, train_metrics, val_metrics)
+            # Log epoch summary (only on main process)
+            if self.accelerator.is_main_process:
+                self.log_epoch_summary(epoch, train_metrics, val_metrics)
 
-            # Save checkpoint
-            if val_metrics['val_loss'] < self.best_val_loss:
-                self.best_val_loss = val_metrics['val_loss']
-                self.save_checkpoint(epoch, is_best=True)
-                logger.info(
-                    f"New best validation loss: {self.best_val_loss:.4f}")
-            else:
-                self.save_checkpoint(epoch, is_best=False)
+                # Save checkpoint
+                if val_metrics['val_loss'] < self.best_val_loss:
+                    self.best_val_loss = val_metrics['val_loss']
+                    self.save_checkpoint(epoch, is_best=True)
+                    logger.info(
+                        f"New best validation loss: {self.best_val_loss:.4f}")
+                else:
+                    self.save_checkpoint(epoch, is_best=False)
 
-        # Save final model
-        self.save_final_model()
-        self.save_training_history()
-        logger.info("Training completed!")
+        # Save final model (only on main process)
+        if self.accelerator.is_main_process:
+            self.save_final_model()
+            self.save_training_history()
+            logger.info("Training completed!")
 
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """
@@ -347,60 +386,66 @@ class Trainer:
         epoch_losses = []
         epoch_metrics = {}
 
+        # Only show progress bar on main process
         progress_bar = tqdm(
             self.train_dataloader,
             desc=f"Training Epoch {epoch + 1}",
-            leave=True
+            leave=True,
+            disable=not self.accelerator.is_main_process
         )
 
-        self.optimizer.zero_grad()
-
         for step, batch in enumerate(progress_bar):
-            # Compute loss
-            loss, metrics = self.distillation_method.compute_loss(batch)
+            with self.accelerator.accumulate(self.distillation_method.student_model):
+                # Compute loss
+                loss, metrics = self.distillation_method.compute_loss(batch)
 
-            # Scale loss for gradient accumulation
-            loss = loss / self.config.gradient_accumulation_steps
-            loss.backward()
+                # Backward pass (Accelerate handles gradient scaling)
+                self.accelerator.backward(loss)
+
+                # Clip gradients
+                if self.accelerator.sync_gradients:
+                    self.accelerator.clip_grad_norm_(
+                        self.distillation_method.student_model.parameters(),
+                        self.config.max_grad_norm
+                    )
+
+                # Optimizer step
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
+
+            # Gather metrics from all processes
+            loss_gathered = self.accelerator.gather(loss.detach())
+            avg_loss = loss_gathered.mean().item()
 
             # Accumulate metrics
-            epoch_losses.append(
-                loss.item() * self.config.gradient_accumulation_steps)
+            epoch_losses.append(avg_loss)
             for key, value in metrics.items():
                 if key not in epoch_metrics:
                     epoch_metrics[key] = []
                 epoch_metrics[key].append(value)
 
-            # Update weights
-            if (step + 1) % self.config.gradient_accumulation_steps == 0:
-                # Clip gradients
-                torch.nn.utils.clip_grad_norm_(
-                    self.distillation_method.student_model.parameters(),
-                    self.config.max_grad_norm
-                )
-
-                self.optimizer.step()
-                self.scheduler.step()
-                self.optimizer.zero_grad()
-
-                self.global_step += 1
-
-                # Update progress bar
+            # Update progress bar (only on main process)
+            if self.accelerator.is_main_process:
                 progress_bar.set_postfix({
-                    'loss': f"{epoch_losses[-1]:.4f}",
+                    'loss': f"{avg_loss:.4f}",
                     'lr': f"{self.scheduler.get_last_lr()[0]:.2e}"
                 })
 
-                # Periodic logging
-                if self.global_step % self.config.logging_steps == 0:
-                    self.log_training_step(
-                        epoch, step, epoch_losses[-1], metrics)
+            # Increment global step only when gradients are synced
+            if self.accelerator.sync_gradients:
+                self.global_step += 1
+
+                # Periodic logging (only on main process)
+                if self.accelerator.is_main_process and self.global_step % self.config.logging_steps == 0:
+                    self.log_training_step(epoch, step, avg_loss, metrics)
 
                 # Periodic evaluation
                 if self.config.eval_steps > 0 and self.global_step % self.config.eval_steps == 0:
                     val_metrics = self.evaluate()
-                    logger.info(
-                        f"Step {self.global_step} - Val Loss: {val_metrics['val_loss']:.4f}")
+                    if self.accelerator.is_main_process:
+                        logger.info(
+                            f"Step {self.global_step} - Val Loss: {val_metrics['val_loss']:.4f}")
                     self.distillation_method.student_model.train()
 
         # Compute epoch averages
@@ -426,10 +471,18 @@ class Trainer:
         val_metrics = {}
 
         with torch.no_grad():
-            for batch in tqdm(self.val_dataloader, desc="Validation", leave=False):
+            for batch in tqdm(
+                self.val_dataloader,
+                desc="Validation",
+                leave=False,
+                disable=not self.accelerator.is_main_process
+            ):
                 loss, metrics = self.distillation_method.compute_loss(batch)
 
-                val_losses.append(loss.item())
+                # Gather losses from all processes
+                loss_gathered = self.accelerator.gather(loss.detach())
+                val_losses.append(loss_gathered.mean().item())
+
                 for key, value in metrics.items():
                     if key not in val_metrics:
                         val_metrics[key] = []
@@ -443,7 +496,7 @@ class Trainer:
         return avg_metrics
 
     def log_training_step(self, epoch: int, step: int, loss: float, metrics: Dict[str, float]):
-        """Log training step metrics."""
+        """Log training step metrics (only called on main process)."""
         log_str = f"Epoch {epoch + 1}, Step {step + 1}, Global Step {self.global_step}: "
         log_str += f"Loss = {loss:.4f}, LR = {self.scheduler.get_last_lr()[0]:.2e}"
         for key, value in metrics.items():
@@ -452,7 +505,7 @@ class Trainer:
         logger.info(log_str)
 
     def log_epoch_summary(self, epoch: int, train_metrics: Dict[str, float], val_metrics: Dict[str, float]):
-        """Log epoch summary."""
+        """Log epoch summary (only called on main process)."""
         logger.info(f"\nEpoch {epoch + 1} Summary:")
         logger.info(f"  Train Loss: {train_metrics['train_loss']:.4f}")
         logger.info(f"  Val Loss: {val_metrics['val_loss']:.4f}")
@@ -465,7 +518,7 @@ class Trainer:
 
     def save_checkpoint(self, epoch: int, is_best: bool = False):
         """
-        Save model checkpoint.
+        Save model checkpoint (only called on main process).
 
         :param epoch: Current epoch number
         :type epoch: int
@@ -476,10 +529,14 @@ class Trainer:
         checkpoint_path = os.path.join(
             self.config.checkpoint_dir, checkpoint_name)
 
+        # Unwrap the model from Accelerate wrapper
+        unwrapped_model = self.accelerator.unwrap_model(
+            self.distillation_method.student_model)
+
         checkpoint = {
             'epoch': epoch,
             'global_step': self.global_step,
-            'model_state_dict': self.distillation_method.student_model.state_dict(),
+            'model_state_dict': unwrapped_model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'best_val_loss': self.best_val_loss,
@@ -490,16 +547,19 @@ class Trainer:
         logger.info(f"Saved checkpoint to {checkpoint_path}")
 
     def save_final_model(self):
-        """Save final trained model."""
+        """Save final trained model (only called on main process)."""
         final_model_path = os.path.join(self.config.output_dir, "final_model")
 
+        # Unwrap the model from Accelerate wrapper
+        unwrapped_model = self.accelerator.unwrap_model(
+            self.distillation_method.student_model)
+
         # Save student model
-        self.distillation_method.student_model.save_pretrained(
-            final_model_path)
+        unwrapped_model.save_pretrained(final_model_path)
         logger.info(f"Saved final model to {final_model_path}")
 
     def save_training_history(self):
-        """Save training history to JSON."""
+        """Save training history to JSON (only called on main process)."""
         history_path = os.path.join(
             self.config.results_dir, "training_history.json")
         with open(history_path, 'w') as f:
@@ -585,6 +645,11 @@ def main():
     parser.add_argument('--max_new_tokens', type=int, default=256,
                         help='Maximum new tokens to generate')
 
+    # Multi-GPU arguments
+    parser.add_argument('--mixed_precision', type=str, default='bf16',
+                        choices=['no', 'fp16', 'bf16'],
+                        help='Mixed precision training mode')
+
     # Misc arguments
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
@@ -599,6 +664,17 @@ def main():
 
     args = parser.parse_args()
 
+    # Initialize Accelerator FIRST (before any model/data loading)
+    # This handles all multi-GPU setup automatically
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision=args.mixed_precision,
+        log_with="tensorboard",
+        project_dir=args.output_dir,
+        kwargs_handlers=[ddp_kwargs]
+    )
+
     # Initialize config
     config = TrainingConfig(args)
 
@@ -606,25 +682,35 @@ def main():
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
 
-    # Log configuration
-    logger.info("Training Configuration:")
-    for key, value in config.to_dict().items():
-        logger.info(f"  {key}: {value}")
+    # Log configuration (only on main process)
+    if accelerator.is_main_process:
+        logger.info("="*80)
+        logger.info("MULTI-GPU TRAINING WITH ACCELERATE")
+        logger.info("="*80)
+        logger.info(f"Number of processes: {accelerator.num_processes}")
+        logger.info(f"Mixed precision: {accelerator.mixed_precision}")
+        logger.info(f"Device: {accelerator.device}")
+        logger.info("\nTraining Configuration:")
+        for key, value in config.to_dict().items():
+            logger.info(f"  {key}: {value}")
 
-    # Save configuration
-    config_path = os.path.join(config.output_dir, "config.json")
-    with open(config_path, 'w') as f:
-        json.dump(config.to_dict(), f, indent=2)
+        # Save configuration
+        config_path = os.path.join(config.output_dir, "config.json")
+        with open(config_path, 'w') as f:
+            json.dump(config.to_dict(), f, indent=2)
 
-    # Load tokenizer
+    # Load tokenizer (same on all processes)
     tokenizer = load_tokenizer(config.student_model_name)
 
-    # Load models
+    # Load teacher model (on main GPU only for inference)
+    # Place teacher on the same device as the main process
     teacher_model = load_teacher_model(
         config.teacher_model_name,
-        use_quantization=config.use_quantization
+        use_quantization=config.use_quantization,
+        device=accelerator.device
     )
 
+    # Load student model (will be distributed by Accelerate)
     lora_config_dict = {
         'r': config.lora_rank,
         'lora_alpha': config.lora_alpha,
