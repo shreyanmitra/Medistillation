@@ -91,7 +91,7 @@ class BaseDistillationMethod(ABC):
 
     
     @abstractmethod
-    def compute_loss(self, batch: BatchDict) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def compute_loss(self, batch: 'BaseDistillationMethod.BatchDict') -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Calculate the loss (error) for one training batch.
         Different distillation methods will calculate loss differently.
@@ -144,7 +144,7 @@ class BaseDistillationMethod(ABC):
             'attention_mask': tokenized['attention_mask']
         }
     
-    def prepare_batch(self, batch: BatchDict) -> BatchDict:
+    def prepare_batch(self, batch: 'BaseDistillationMethod.BatchDict') -> 'BaseDistillationMethod.BatchDict':
         """
         Helper method: Tokenize prompts (if needed) and move batch data to correct device (GPU/CPU).
 
@@ -206,7 +206,7 @@ class StandardSFT(BaseDistillationMethod):
         print(f"Initialized {self.get_method_name()}")
         print(f"  → Max new tokens: {self.max_new_tokens}")
     
-    def compute_loss(self, batch: BatchDict) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def compute_loss(self, batch: 'BaseDistillationMethod.BatchDict') -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Compute standard cross-entropy loss for supervised fine-tuning.
         
@@ -345,7 +345,7 @@ class LogitKD(BaseDistillationMethod):
         print(f"  → Temperature (T) = {self.temperature}")
         print(f"  → Max new tokens: {self.max_new_tokens}")
     
-    def compute_loss(self, batch: BatchDict) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def compute_loss(self, batch: 'BaseDistillationMethod.BatchDict') -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Compute combined KL divergence and cross-entropy loss.
         
@@ -533,7 +533,7 @@ class TokenAdaptiveKD(BaseDistillationMethod):
         print(f"  → Temperature Range: [{self.min_temperature}, {self.max_temperature}]")
         print(f"  → Max new tokens: {self.max_new_tokens}")
     
-    def compute_loss(self, batch: BatchDict) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def compute_loss(self, batch: 'BaseDistillationMethod.BatchDict') -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Compute token-adaptive KL divergence and cross-entropy loss.
         
@@ -718,7 +718,7 @@ class ChainOfThoughtDistillation(BaseDistillationMethod):
         if self.num_rationales > 1:
             print(f"  → Sampling temperature: {self.sampling_temperature}")
     
-    def compute_loss(self, batch: BatchDict) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def compute_loss(self, batch: 'BaseDistillationMethod.BatchDict') -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Compute cross-entropy loss on teacher's chain-of-thought reasoning.
         
@@ -902,7 +902,7 @@ class IntermediateFeatureMatching(BaseDistillationMethod):
         print(f"  → Use projections: {self.use_projections}")
         print(f"  → Max new tokens: {self.max_new_tokens}")
     
-    def compute_loss(self, batch: BatchDict) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def compute_loss(self, batch: 'BaseDistillationMethod.BatchDict') -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Compute combined feature matching and cross-entropy loss.
         
@@ -1082,7 +1082,7 @@ class AttentionDistillation(BaseDistillationMethod):
         print(f"  → Match all heads: {self.match_all_heads}")
         print(f"  → Max new tokens: {self.max_new_tokens}")
     
-    def compute_loss(self, batch: BatchDict) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def compute_loss(self, batch: 'BaseDistillationMethod.BatchDict') -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Compute combined attention matching and cross-entropy loss.
         
@@ -1318,7 +1318,7 @@ class BaseRLDistillationMethod(BaseDistillationMethod):
         """
         pass
     
-    def compute_loss(self, batch: BatchDict) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def compute_loss(self, batch: 'BaseDistillationMethod.BatchDict') -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         RL-compatible loss computation. Overrides BaseDistillationMethod.compute_loss().
         
