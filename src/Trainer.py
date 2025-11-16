@@ -126,6 +126,7 @@ class TrainingConfig:
         self.lora_alpha: int = args.lora_alpha
         self.lora_dropout: float = args.lora_dropout
         self.use_quantization: bool = args.use_quantization
+        self.enable_cpu_offload: bool = args.enable_cpu_offload  # For large teacher models (70B+)
 
         # Method-specific hyperparameters
         self.alpha: float = args.alpha  # For Logit-KD, AdaKD, FitNets, Attention
@@ -175,12 +176,14 @@ class TrainingConfig:
 # MODEL SETUP
 # ==============================================================================
 
-def setup_quantization_config() -> BitsAndBytesConfig:
+def setup_quantization_config(enable_cpu_offload: bool = False) -> BitsAndBytesConfig:
     """
     Configure 8-bit quantization for memory-efficient model loading.
     
     Uses QLoRA technique to enable loading large models on consumer GPUs.
 
+    :param enable_cpu_offload: Enable CPU offloading for models too large for GPU
+    :type enable_cpu_offload: bool
     :returns: Quantization configuration
     :rtype: BitsAndBytesConfig
     """
@@ -188,12 +191,14 @@ def setup_quantization_config() -> BitsAndBytesConfig:
         load_in_8bit=True,
         llm_int8_threshold=6.0,
         llm_int8_has_fp16_weight=False,
+        llm_int8_enable_fp32_cpu_offload=enable_cpu_offload,  # Enable CPU offload for 70B models
     )
 
 
 def load_teacher_model(
     model_name: str,
-    use_quantization: bool = True
+    use_quantization: bool = True,
+    enable_cpu_offload: bool = False
 ) -> nn.Module:
     """
     Load teacher model with optional quantization.
@@ -202,15 +207,20 @@ def load_teacher_model(
     :type model_name: str
     :param use_quantization: Whether to use 8-bit quantization
     :type use_quantization: bool
+    :param enable_cpu_offload: Enable CPU offloading for large models (70B+)
+    :type enable_cpu_offload: bool
     :returns: Loaded teacher model
     :rtype: nn.Module
     """
     logger.info(f"Loading teacher model: {model_name}")
+    
+    if enable_cpu_offload:
+        logger.info("CPU offloading ENABLED - model layers will overflow to CPU/RAM")
 
     if use_quantization:
         # Use 8-bit quantization to reduce memory footprint (QLoRA technique)
         # This allows loading large models (7B+ parameters) on consumer GPUs
-        quantization_config = setup_quantization_config()
+        quantization_config = setup_quantization_config(enable_cpu_offload=enable_cpu_offload)
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             quantization_config=quantization_config,  # Apply 8-bit quantization
@@ -2549,6 +2559,8 @@ def main():
                         help='LoRA dropout')
     parser.add_argument('--use_quantization', action='store_true', default=True,
                         help='Use 8-bit quantization (QLoRA)')
+    parser.add_argument('--enable_cpu_offload', action='store_true', default=False,
+                        help='Enable CPU offloading for large teacher models (70B+)')
 
     # Method-specific arguments
     parser.add_argument('--alpha', type=float, default=0.5,
@@ -2632,7 +2644,8 @@ def main():
     # Load models
     teacher_model = load_teacher_model(
         config.teacher_model_name,
-        use_quantization=config.use_quantization
+        use_quantization=config.use_quantization,
+        enable_cpu_offload=config.enable_cpu_offload
     )
 
     lora_config_dict = {
