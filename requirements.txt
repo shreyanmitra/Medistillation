@@ -24,6 +24,24 @@ pandas>=2.0.0
 scikit-learn>=1.3.0
 scipy>=1.11.0
 
+# RAGAS/NLI evaluation (for FidelityBench-Med)
+sentence-transformers>=2.2.0
+# Note: NLI model (microsoft/deberta-v3-base-mnli) will be auto-downloaded by transformers
+
+# Text similarity metrics (for fidelity evaluation)
+nltk>=3.8.0
+rouge-score>=0.1.2
+
+# Visualization libraries
+matplotlib>=3.5.0
+seaborn>=0.12.0
+plotly>=5.18.0
+kaleido>=0.2.1  # For static image export from Plotly
+
+# Jupyter notebook enhancements
+ipywidgets>=8.1.0
+jupyter>=1.0.0
+
 # Configuration and logging
 pyyaml>=6.0
 wandb>=0.15.0  # Optional: if you want to use Weights & Biases for logging

@@ -22,7 +22,7 @@ import torch.nn.functional as F
 # Import HuggingFace transformers for tokenizer types and models
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
-from typing import Dict, Tuple, Any, Optional, final, TypedDict, Union #For type-checking
+from typing import Dict, Tuple, Any, Optional, final, TypedDict, Union, List #For type-checking
 
 # Type alias for cleaner type hints
 TokenizerType = Union[PreTrainedTokenizer, PreTrainedTokenizerFast]
@@ -466,7 +466,204 @@ class LogitKD(BaseDistillationMethod):
 
 
 # ==============================================================================
-# METHOD 3: CHAIN-OF-THOUGHT DISTILLATION (CoT)
+# METHOD 3: TOKEN-ADAPTIVE KNOWLEDGE DISTILLATION (AdaKD)
+# ==============================================================================
+
+class TokenAdaptiveKD(BaseDistillationMethod):
+    """
+    Token-Adaptive Knowledge Distillation with per-token temperature scaling.
+    
+    Extends standard Logit-KD by adaptively adjusting the temperature parameter for each 
+    token based on the student's prediction confidence. Tokens where the student is less 
+    confident receive higher temperatures (softer distributions) to provide more learning 
+    signal, while confident predictions use lower temperatures.
+    
+    **Reference**:
+    Li, X., et al. (2025)
+    "Token-Level Adaptive Knowledge Distillation for Large Language Models"
+    (Related concept from adaptive distillation literature)
+
+    :param teacher_model: Pre-trained teacher model to distill from
+    :type teacher_model: class: `nn.Module`
+    :param student_model: Student model to be trained
+    :type student_model: class: `nn.Module`
+    :param tokenizer: Tokenizer compatible with both models
+    :type tokenizer: TokenizerType
+    :param config: Configuration dictionary with 'alpha' (KD weight, default 0.5), 'base_temperature' (base T, default 3.0), 'min_temperature' (min T, default 1.0), 'max_temperature' (max T, default 5.0), and optional 'max_new_tokens' (default 256)
+    :type config: Dict[str, Any]
+    :raises ValueError: If alpha not in [0, 1] or temperatures invalid
+    """
+    
+    alpha: float
+    base_temperature: float
+    min_temperature: float
+    max_temperature: float
+    max_new_tokens: int
+    
+    def __init__(
+        self,
+        teacher_model: nn.Module,
+        student_model: nn.Module,
+        tokenizer: TokenizerType,
+        config: Dict[str, Any]
+    ) -> None:
+        """Constructor
+        """
+        super().__init__(teacher_model, student_model, tokenizer, config)
+        
+        self.alpha: float = config.get('alpha', 0.5)
+        if not 0.0 <= self.alpha <= 1.0:
+            raise ValueError(f"Alpha must be in [0, 1], got {self.alpha}")
+        
+        self.base_temperature: float = config.get('base_temperature', 3.0)
+        self.min_temperature: float = config.get('min_temperature', 1.0)
+        self.max_temperature: float = config.get('max_temperature', 5.0)
+        
+        if not (0 < self.min_temperature <= self.base_temperature <= self.max_temperature):
+            raise ValueError(
+                f"Temperature constraints violated: 0 < min_T <= base_T <= max_T, "
+                f"got min={self.min_temperature}, base={self.base_temperature}, max={self.max_temperature}"
+            )
+        
+        self.max_new_tokens: int = config.get('max_new_tokens', 256)
+        
+        print(f"Initialized {self.get_method_name()}")
+        print(f"  → Alpha (α) = {self.alpha}")
+        print(f"  → Base Temperature = {self.base_temperature}")
+        print(f"  → Temperature Range: [{self.min_temperature}, {self.max_temperature}]")
+        print(f"  → Max new tokens: {self.max_new_tokens}")
+    
+    def compute_loss(self, batch: BatchDict) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Compute token-adaptive KL divergence and cross-entropy loss.
+        
+        Adjusts temperature per token based on student confidence (entropy of predictions).
+        Higher entropy (uncertainty) → higher temperature → softer targets → more learning signal.
+        
+        :param batch: Input batch containing tokenized input sequences (prompts only)
+        :type batch: BatchDict
+        :returns: Tuple of (combined loss tensor, metrics dictionary)
+        :rtype: Tuple[torch.Tensor, Dict[str, float]]
+        """
+        batch = self.prepare_batch(batch)
+        
+        input_ids = batch['input_ids']
+        attention_mask = batch['attention_mask']
+        
+        # Generate teacher responses on-the-fly
+        with torch.no_grad():
+            full_sequence = self.teacher_model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id
+            )
+            
+            prompt_length = input_ids.size(1)
+            response_length = full_sequence.size(1) - prompt_length
+            
+            labels = torch.full_like(full_sequence, -100)
+            labels[:, prompt_length:] = full_sequence[:, prompt_length:]
+            batch['labels'] = labels
+            
+            full_attention_mask = torch.cat([
+                attention_mask,
+                torch.ones(
+                    (attention_mask.size(0), response_length),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device
+                )
+            ], dim=1)
+            
+            # Teacher forward pass
+            teacher_outputs = self.teacher_model(
+                input_ids=full_sequence,
+                attention_mask=full_attention_mask
+            )
+            teacher_logits = teacher_outputs.logits
+        
+        # Student forward pass
+        student_outputs = self.student_model(
+            input_ids=full_sequence,
+            attention_mask=full_attention_mask
+        )
+        student_logits = student_outputs.logits
+        
+        # Calculate per-token uncertainty (entropy) for adaptive temperature
+        student_probs = F.softmax(student_logits, dim=-1)
+        entropy = -(student_probs * torch.log(student_probs + 1e-10)).sum(dim=-1)  # [batch, seq]
+        
+        # Normalize entropy to [0, 1] range
+        max_entropy = torch.log(torch.tensor(student_logits.size(-1), dtype=torch.float, device=entropy.device))
+        normalized_entropy = entropy / max_entropy
+        
+        # Map entropy to temperature: high entropy → high temperature
+        adaptive_temp = self.min_temperature + (self.max_temperature - self.min_temperature) * normalized_entropy
+        adaptive_temp = adaptive_temp.unsqueeze(-1)  # [batch, seq, 1] for broadcasting
+        
+        # Apply adaptive temperature scaling
+        student_soft_logits = student_logits / adaptive_temp
+        teacher_soft_logits = teacher_logits / adaptive_temp
+        
+        # Compute KL divergence loss (only on response tokens)
+        response_mask = (labels != -100)  # [batch, seq]
+        
+        student_log_probs = F.log_softmax(student_soft_logits, dim=-1)
+        teacher_probs = F.softmax(teacher_soft_logits, dim=-1)
+        
+        kl_per_token = F.kl_div(
+            student_log_probs,
+            teacher_probs,
+            reduction='none'
+        ).sum(dim=-1)  # [batch, seq]
+        
+        # Scale by temperature squared (per token)
+        kl_per_token = kl_per_token * (adaptive_temp.squeeze(-1) ** 2)
+        
+        # Apply mask and average
+        kd_loss = (kl_per_token * response_mask).sum() / response_mask.sum()
+        
+        # Compute cross-entropy loss for hard targets
+        shift_logits = student_logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        
+        ce_loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100
+        )
+        
+        # Combine losses
+        total_loss = self.alpha * kd_loss + (1.0 - self.alpha) * ce_loss
+        
+        # Calculate average temperature used (for logging)
+        avg_temp = (adaptive_temp.squeeze(-1) * response_mask).sum() / response_mask.sum()
+        
+        metrics = {
+            'total_loss': total_loss.item(),
+            'kd_loss': kd_loss.item(),
+            'ce_loss': ce_loss.item(),
+            'avg_temperature': avg_temp.item(),
+            'avg_entropy': (entropy * response_mask).sum().item() / response_mask.sum().item(),
+            'avg_response_length': float(response_length)
+        }
+        
+        return total_loss, metrics
+    
+    def get_method_name(self) -> str:
+        """
+        Return method identifier with hyperparameters for logging.
+        
+        :returns: Method name string
+        :rtype: str
+        """
+        return f"AdaKD (α={self.alpha}, T∈[{self.min_temperature},{self.max_temperature}])"
+
+
+# ==============================================================================
+# METHOD 4: CHAIN-OF-THOUGHT DISTILLATION (CoT)
 # ==============================================================================
 
 class ChainOfThoughtDistillation(BaseDistillationMethod):
@@ -625,41 +822,43 @@ class ChainOfThoughtDistillation(BaseDistillationMethod):
 
 
 # ==============================================================================
-# METHOD 4: DIRECT PREFERENCE OPTIMIZATION (DPO)
+# METHOD 5: INTERMEDIATE FEATURE MATCHING / FITNETS
 # ==============================================================================
 
-class DirectPreferenceOptimization(BaseDistillationMethod):
+class IntermediateFeatureMatching(BaseDistillationMethod):
     """
-    Direct Preference Optimization (DPO) for preference-based alignment.
+    Intermediate Feature Matching (FitNets-style) for hidden state distillation.
     
-    Trains student model using pre-collected preference pairs (preferred vs dispreferred responses)
-    without requiring explicit reward models. Uses a simple classification-style loss that directly
-    optimizes the policy to prefer better responses.
+    Transfers knowledge by matching the student's internal representations (hidden states)
+    to the teacher's at corresponding layers. Uses MSE loss between teacher and student
+    hidden states, optionally with projection layers to handle dimension mismatches.
     
-    Unlike RLHF, DPO does NOT use reinforcement learning or sample during training. Instead, it
-    operates on fixed preference pairs and uses a closed-form solution derived from the
-    Bradley-Terry preference model.
+    Operates in online mode: teacher generates responses and computes hidden states
+    during training. Combines feature matching loss with standard cross-entropy.
     
     **Reference**:
-    Rafailov, R., Sharma, A., Mitchell, E., et al. (2023).
-    "Direct Preference Optimization: Your Language Model is Secretly a Reward Model"
-    https://arxiv.org/abs/2305.18290
+    Romero, A., et al. (2014).
+    "FitNets: Hints for Thin Deep Nets"
+    https://arxiv.org/abs/1412.6550
 
-    :param teacher_model: Used as reference model (typically the initial/SFT model, often same as student initially)
+    :param teacher_model: Pre-trained teacher model
     :type teacher_model: class: `nn.Module`
-    :param student_model: Policy model to be trained/aligned
+    :param student_model: Student model to be trained
     :type student_model: class: `nn.Module`
     :param tokenizer: Tokenizer compatible with both models
     :type tokenizer: TokenizerType
-    :param config: Configuration dictionary with 'beta' (DPO temperature, default 0.1), controls strength of KL regularization
+    :param config: Configuration dictionary with 'alpha' (feature weight, default 0.5), 
+        'layer_mapping' (dict mapping student layers to teacher layers, e.g., {6: 12}),
+        optional 'max_new_tokens' (default 256), and optional 'use_projections' (default True)
     :type config: Dict[str, Any]
-    :raises ValueError: If beta <= 0
-    
-    Note: This implementation expects batches to contain 'preferred_ids', 'preferred_mask', 
-    'dispreferred_ids', 'dispreferred_mask' instead of generating responses on-the-fly.
+    :raises ValueError: If alpha not in [0, 1] or layer_mapping invalid
     """
     
-    beta: float
+    alpha: float
+    layer_mapping: Dict[int, int]
+    use_projections: bool
+    max_new_tokens: int
+    projections: nn.ModuleDict
     
     def __init__(
         self,
@@ -672,138 +871,1335 @@ class DirectPreferenceOptimization(BaseDistillationMethod):
         """
         super().__init__(teacher_model, student_model, tokenizer, config)
         
-        self.beta: float = config.get('beta', 0.1) #DPO temperature parameter (KL regularization strength)
-        if self.beta <= 0:
-            raise ValueError(f"Beta must be > 0, got {self.beta}")
+        self.alpha: float = config.get('alpha', 0.5)
+        if not 0.0 <= self.alpha <= 1.0:
+            raise ValueError(f"Alpha must be in [0, 1], got {self.alpha}")
+        
+        self.layer_mapping: Dict[int, int] = config.get('layer_mapping', {})
+        if not self.layer_mapping:
+            raise ValueError("layer_mapping must be provided (e.g., {6: 12} maps student layer 6 to teacher layer 12)")
+        
+        self.use_projections: bool = config.get('use_projections', True)
+        self.max_new_tokens: int = config.get('max_new_tokens', 256)
+        
+        # Create projection layers if dimensions don't match
+        self.projections = nn.ModuleDict()
+        if self.use_projections:
+            student_hidden_size = student_model.config.hidden_size
+            teacher_hidden_size = teacher_model.config.hidden_size
+            
+            if student_hidden_size != teacher_hidden_size:
+                for student_layer in self.layer_mapping.keys():
+                    self.projections[str(student_layer)] = nn.Linear(
+                        student_hidden_size,
+                        teacher_hidden_size,
+                        bias=False
+                    ).to(self.get_device())
         
         print(f"Initialized {self.get_method_name()}")
-        print(f"  → Beta (β) = {self.beta}")
-        print(f"  → Note: Requires preference pairs in batch data")
-        print(f"  → Batch must contain: preferred_ids, preferred_mask, dispreferred_ids, dispreferred_mask")
+        print(f"  → Alpha (α) = {self.alpha}")
+        print(f"  → Layer mapping: {self.layer_mapping}")
+        print(f"  → Use projections: {self.use_projections}")
+        print(f"  → Max new tokens: {self.max_new_tokens}")
     
     def compute_loss(self, batch: BatchDict) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        Compute DPO loss using pre-collected preference pairs.
+        Compute combined feature matching and cross-entropy loss.
         
-        Expects batch to contain both preferred and dispreferred response pairs.
-        Computes log probabilities under policy (student) and reference (teacher) models,
-        then optimizes the policy to increase probability of preferred responses relative
-        to dispreferred ones using the DPO objective.
+        Matches student's intermediate hidden states to teacher's using MSE loss,
+        combined with standard cross-entropy loss on outputs.
         
-        DPO Loss: -log(σ(β * (log π_θ(y_w|x) - log π_θ(y_l|x) - log π_ref(y_w|x) + log π_ref(y_l|x))))
-        where y_w is preferred (chosen), y_l is dispreferred (rejected)
-        
-        :param batch: Input batch containing preference pairs. Must have keys:
-            - 'preferred_ids': Tokenized preferred completions (prompt + response) [batch, seq_len_w]
-            - 'preferred_mask': Attention mask for preferred [batch, seq_len_w]
-            - 'dispreferred_ids': Tokenized dispreferred completions [batch, seq_len_l]
-            - 'dispreferred_mask': Attention mask for dispreferred [batch, seq_len_l]
-            - 'prompt_lengths': Length of prompt for each example [batch] (to mask prompt in loss)
-        :type batch: BatchDict (extended with preference-specific keys)
-        :returns: Tuple of (DPO loss tensor, metrics dictionary)
+        :param batch: Input batch containing tokenized input sequences (prompts only)
+        :type batch: BatchDict
+        :returns: Tuple of (combined loss tensor, metrics dictionary)
         :rtype: Tuple[torch.Tensor, Dict[str, float]]
         """
-        batch = self.prepare_batch(batch) #Bring everything to same device
+        batch = self.prepare_batch(batch)
         
-        # Extract preference pair data from batch
-        if 'preferred_ids' not in batch or 'dispreferred_ids' not in batch:
-            raise ValueError(
-                "DPO requires preference pairs in batch. "
-                "Batch must contain: 'preferred_ids', 'preferred_mask', 'dispreferred_ids', 'dispreferred_mask', 'prompt_lengths'"
-            )
+        input_ids = batch['input_ids']
+        attention_mask = batch['attention_mask']
         
-        preferred_ids = batch['preferred_ids']  # [batch, seq_len_w]
-        preferred_mask = batch['preferred_mask']  # [batch, seq_len_w]
-        dispreferred_ids = batch['dispreferred_ids']  # [batch, seq_len_l]
-        dispreferred_mask = batch['dispreferred_mask']  # [batch, seq_len_l]
-        prompt_lengths = batch.get('prompt_lengths', None)  # [batch]
-        
-        # Helper function to compute per-token log probabilities
-        def get_log_probs(model, input_ids, attention_mask, labels):
-            """Compute log probabilities for the response tokens only"""
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            logits = outputs.logits  # [batch, seq, vocab]
-            
-            # Shift for autoregressive: predict next token
-            shift_logits = logits[..., :-1, :].contiguous()  # [batch, seq-1, vocab]
-            shift_labels = labels[..., 1:].contiguous()  # [batch, seq-1]
-            
-            # Compute log probabilities
-            log_probs = F.log_softmax(shift_logits, dim=-1)  # [batch, seq-1, vocab]
-            
-            # Gather log probs of actual tokens
-            per_token_logps = torch.gather(
-                log_probs, 
-                dim=2, 
-                index=shift_labels.unsqueeze(2)
-            ).squeeze(2)  # [batch, seq-1]
-            
-            # Mask out prompt tokens (only compute on response)
-            response_mask = (shift_labels != -100).float()  # [batch, seq-1]
-            
-            # Average log prob over response tokens
-            sequence_logp = (per_token_logps * response_mask).sum(dim=1) / response_mask.sum(dim=1)
-            return sequence_logp
-        
-        # Create labels (mask prompt with -100)
-        preferred_labels = preferred_ids.clone()
-        dispreferred_labels = dispreferred_ids.clone()
-        
-        if prompt_lengths is not None:
-            for i, prompt_len in enumerate(prompt_lengths):
-                preferred_labels[i, :prompt_len] = -100
-                dispreferred_labels[i, :prompt_len] = -100
-        
-        # Store first preferred sequence in batch for inspection
-        batch['labels'] = preferred_labels
-        
-        # Compute policy (student) log probs
-        policy_preferred_logps = get_log_probs(self.student_model, preferred_ids, preferred_mask, preferred_labels)
-        policy_dispreferred_logps = get_log_probs(self.student_model, dispreferred_ids, dispreferred_mask, dispreferred_labels)
-        
-        # Compute reference (teacher) log probs
+        # Generate teacher responses
         with torch.no_grad():
-            ref_preferred_logps = get_log_probs(self.teacher_model, preferred_ids, preferred_mask, preferred_labels)
-            ref_dispreferred_logps = get_log_probs(self.teacher_model, dispreferred_ids, dispreferred_mask, dispreferred_labels)
+            full_sequence = self.teacher_model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id
+            )
+            
+            prompt_length = input_ids.size(1)
+            response_length = full_sequence.size(1) - prompt_length
+            
+            labels = torch.full_like(full_sequence, -100)
+            labels[:, prompt_length:] = full_sequence[:, prompt_length:]
+            batch['labels'] = labels
+            
+            full_attention_mask = torch.cat([
+                attention_mask,
+                torch.ones(
+                    (attention_mask.size(0), response_length),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device
+                )
+            ], dim=1)
+            
+            # Teacher forward pass with hidden states
+            teacher_outputs = self.teacher_model(
+                input_ids=full_sequence,
+                attention_mask=full_attention_mask,
+                output_hidden_states=True
+            )
+            teacher_hidden_states = teacher_outputs.hidden_states  # Tuple of [batch, seq, hidden]
         
-        # DPO loss computation
-        # Compute log ratios: log(π_θ/π_ref) for preferred and dispreferred
-        preferred_log_ratio = policy_preferred_logps - ref_preferred_logps
-        dispreferred_log_ratio = policy_dispreferred_logps - ref_dispreferred_logps
+        # Student forward pass with hidden states and labels
+        student_outputs = self.student_model(
+            input_ids=full_sequence,
+            attention_mask=full_attention_mask,
+            labels=labels,
+            output_hidden_states=True
+        )
+        student_hidden_states = student_outputs.hidden_states  # Tuple of [batch, seq, hidden]
         
-        # DPO objective: -log(σ(β * (log_ratio_preferred - log_ratio_dispreferred)))
-        logits_diff = preferred_log_ratio - dispreferred_log_ratio
-        dpo_loss = -F.logsigmoid(self.beta * logits_diff).mean()
+        # Cross-entropy loss
+        ce_loss = student_outputs.loss
         
-        # Compute implicit reward (for logging)
-        implicit_reward_preferred = self.beta * preferred_log_ratio
-        implicit_reward_dispreferred = self.beta * dispreferred_log_ratio
-        reward_margin = (implicit_reward_preferred - implicit_reward_dispreferred).mean().item()
+        # Feature matching loss
+        feature_loss = 0.0
+        response_mask = (labels != -100).unsqueeze(-1)  # [batch, seq, 1]
         
-        # Compute accuracy (how often preferred is ranked higher)
-        accuracy = (logits_diff > 0).float().mean().item()
+        for student_layer, teacher_layer in self.layer_mapping.items():
+            # Get hidden states (add 1 because layer 0 is embedding, layer 1 is first transformer layer)
+            student_hidden = student_hidden_states[student_layer + 1]  # [batch, seq, hidden_s]
+            teacher_hidden = teacher_hidden_states[teacher_layer + 1]  # [batch, seq, hidden_t]
+            
+            # Apply projection if needed
+            if str(student_layer) in self.projections:
+                student_hidden = self.projections[str(student_layer)](student_hidden)
+            
+            # MSE loss only on response tokens
+            mse_per_token = F.mse_loss(student_hidden, teacher_hidden, reduction='none')  # [batch, seq, hidden]
+            mse_per_token = mse_per_token.mean(dim=-1, keepdim=True)  # [batch, seq, 1]
+            
+            # Mask and average
+            masked_mse = (mse_per_token * response_mask).sum() / response_mask.sum()
+            feature_loss += masked_mse
+        
+        # Average across layers
+        feature_loss = feature_loss / len(self.layer_mapping)
+        
+        # Combine losses
+        total_loss = self.alpha * feature_loss + (1.0 - self.alpha) * ce_loss
         
         metrics = {
-            'dpo_loss': dpo_loss.item(),
-            'total_loss': dpo_loss.item(),
-            'reward_margin': reward_margin,
-            'accuracy': accuracy,
-            'policy_preferred_logp': policy_preferred_logps.mean().item(),
-            'policy_dispreferred_logp': policy_dispreferred_logps.mean().item(),
-            'ref_preferred_logp': ref_preferred_logps.mean().item(),
-            'ref_dispreferred_logp': ref_dispreferred_logps.mean().item()
+            'total_loss': total_loss.item(),
+            'feature_loss': feature_loss.item(),
+            'ce_loss': ce_loss.item(),
+            'feature_weight': self.alpha,
+            'ce_weight': 1.0 - self.alpha,
+            'avg_response_length': float(response_length)
         }
         
-        return dpo_loss, metrics
+        return total_loss, metrics
     
     def get_method_name(self) -> str:
         """
         Return method identifier with hyperparameters for logging.
         
-        :returns: Method name string including beta value
+        :returns: Method name string
         :rtype: str
         """
-        return f"DPO (β={self.beta})"
+        return f"FitNets (α={self.alpha}, layers={len(self.layer_mapping)})"
+
+
+# ==============================================================================
+# METHOD 6: ATTENTION DISTILLATION
+# ==============================================================================
+
+class AttentionDistillation(BaseDistillationMethod):
+    """
+    Attention Transfer for distilling attention patterns.
+    
+    Transfers knowledge by matching the student's self-attention maps to the teacher's
+    at specified layers. Teaches the student which parts of the input to focus on,
+    beyond just matching outputs or hidden states.
+    
+    Uses MSE loss between attention weight matrices. Can specify which attention heads
+    and layers to match.
+    
+    **Reference**:
+    Zagoruyko, S., & Komodakis, N. (2016).
+    "Paying More Attention to Attention: Improving the Performance of CNNs via Attention Transfer"
+    https://arxiv.org/abs/1612.03928
+    
+    (Originally for vision; adapted for LLMs by matching self-attention patterns)
+
+    :param teacher_model: Pre-trained teacher model
+    :type teacher_model: class: `nn.Module`
+    :param student_model: Student model to be trained
+    :type student_model: class: `nn.Module`
+    :param tokenizer: Tokenizer compatible with both models
+    :type tokenizer: TokenizerType
+    :param config: Configuration dictionary with 'alpha' (attention weight, default 0.5),
+        'layer_mapping' (dict mapping student layers to teacher layers),
+        optional 'max_new_tokens' (default 256), and optional 'match_all_heads' (default True)
+    :type config: Dict[str, Any]
+    :raises ValueError: If alpha not in [0, 1] or layer_mapping invalid
+    """
+    
+    alpha: float
+    layer_mapping: Dict[int, int]
+    match_all_heads: bool
+    max_new_tokens: int
+    
+    def __init__(
+        self,
+        teacher_model: nn.Module,
+        student_model: nn.Module,
+        tokenizer: TokenizerType,
+        config: Dict[str, Any]
+    ) -> None:
+        """Constructor
+        """
+        super().__init__(teacher_model, student_model, tokenizer, config)
+        
+        self.alpha: float = config.get('alpha', 0.5)
+        if not 0.0 <= self.alpha <= 1.0:
+            raise ValueError(f"Alpha must be in [0, 1], got {self.alpha}")
+        
+        self.layer_mapping: Dict[int, int] = config.get('layer_mapping', {})
+        if not self.layer_mapping:
+            raise ValueError("layer_mapping must be provided (e.g., {6: 12})")
+        
+        self.match_all_heads: bool = config.get('match_all_heads', True)
+        self.max_new_tokens: int = config.get('max_new_tokens', 256)
+        
+        print(f"Initialized {self.get_method_name()}")
+        print(f"  → Alpha (α) = {self.alpha}")
+        print(f"  → Layer mapping: {self.layer_mapping}")
+        print(f"  → Match all heads: {self.match_all_heads}")
+        print(f"  → Max new tokens: {self.max_new_tokens}")
+    
+    def compute_loss(self, batch: BatchDict) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Compute combined attention matching and cross-entropy loss.
+        
+        Matches student's attention patterns to teacher's using MSE loss on attention weights.
+        
+        :param batch: Input batch containing tokenized input sequences (prompts only)
+        :type batch: BatchDict
+        :returns: Tuple of (combined loss tensor, metrics dictionary)
+        :rtype: Tuple[torch.Tensor, Dict[str, float]]
+        """
+        batch = self.prepare_batch(batch)
+        
+        input_ids = batch['input_ids']
+        attention_mask = batch['attention_mask']
+        
+        # Generate teacher responses
+        with torch.no_grad():
+            full_sequence = self.teacher_model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id
+            )
+            
+            prompt_length = input_ids.size(1)
+            response_length = full_sequence.size(1) - prompt_length
+            
+            labels = torch.full_like(full_sequence, -100)
+            labels[:, prompt_length:] = full_sequence[:, prompt_length:]
+            batch['labels'] = labels
+            
+            full_attention_mask = torch.cat([
+                attention_mask,
+                torch.ones(
+                    (attention_mask.size(0), response_length),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device
+                )
+            ], dim=1)
+            
+            # Teacher forward pass with attentions
+            teacher_outputs = self.teacher_model(
+                input_ids=full_sequence,
+                attention_mask=full_attention_mask,
+                output_attentions=True
+            )
+            teacher_attentions = teacher_outputs.attentions  # Tuple of [batch, heads, seq, seq]
+        
+        # Student forward pass with attentions and labels
+        student_outputs = self.student_model(
+            input_ids=full_sequence,
+            attention_mask=full_attention_mask,
+            labels=labels,
+            output_attentions=True
+        )
+        student_attentions = student_outputs.attentions  # Tuple of [batch, heads, seq, seq]
+        
+        # Cross-entropy loss
+        ce_loss = student_outputs.loss
+        
+        # Attention matching loss
+        attention_loss = 0.0
+        response_mask_2d = (labels != -100)  # [batch, seq]
+        
+        for student_layer, teacher_layer in self.layer_mapping.items():
+            student_attn = student_attentions[student_layer]  # [batch, heads, seq, seq]
+            teacher_attn = teacher_attentions[teacher_layer]  # [batch, heads, seq, seq]
+            
+            if self.match_all_heads:
+                # Average over heads for simpler matching
+                student_attn = student_attn.mean(dim=1)  # [batch, seq, seq]
+                teacher_attn = teacher_attn.mean(dim=1)  # [batch, seq, seq]
+                
+                # MSE loss on attention matrices, masked to response tokens
+                # Mask both query and key dimensions
+                mask_query = response_mask_2d.unsqueeze(-1).float()  # [batch, seq, 1]
+                mask_key = response_mask_2d.unsqueeze(1).float()  # [batch, 1, seq]
+                mask_2d = mask_query * mask_key  # [batch, seq, seq]
+                
+                mse_per_position = F.mse_loss(student_attn, teacher_attn, reduction='none')  # [batch, seq, seq]
+                masked_mse = (mse_per_position * mask_2d).sum() / mask_2d.sum()
+                attention_loss += masked_mse
+            else:
+                # Match each head separately
+                num_heads = student_attn.size(1)
+                for head in range(num_heads):
+                    student_head = student_attn[:, head, :, :]  # [batch, seq, seq]
+                    teacher_head = teacher_attn[:, head, :, :]  # [batch, seq, seq]
+                    
+                    mask_query = response_mask_2d.unsqueeze(-1).float()
+                    mask_key = response_mask_2d.unsqueeze(1).float()
+                    mask_2d = mask_query * mask_key
+                    
+                    mse_per_position = F.mse_loss(student_head, teacher_head, reduction='none')
+                    masked_mse = (mse_per_position * mask_2d).sum() / mask_2d.sum()
+                    attention_loss += masked_mse / num_heads
+        
+        # Average across layers
+        attention_loss = attention_loss / len(self.layer_mapping)
+        
+        # Combine losses
+        total_loss = self.alpha * attention_loss + (1.0 - self.alpha) * ce_loss
+        
+        metrics = {
+            'total_loss': total_loss.item(),
+            'attention_loss': attention_loss.item(),
+            'ce_loss': ce_loss.item(),
+            'attention_weight': self.alpha,
+            'ce_weight': 1.0 - self.alpha,
+            'avg_response_length': float(response_length)
+        }
+        
+        return total_loss, metrics
+    
+    def get_method_name(self) -> str:
+        """
+        Return method identifier with hyperparameters for logging.
+        
+        :returns: Method name string
+        :rtype: str
+        """
+        return f"Attention-Distill (α={self.alpha}, layers={len(self.layer_mapping)})"
+
+
+# ==============================================================================
+# REINFORCEMENT LEARNING BASE CLASS
+# ==============================================================================
+
+class BaseRLDistillationMethod(BaseDistillationMethod):
+    """
+    Base class for Reinforcement Learning-based distillation methods.
+    
+    Extends BaseDistillationMethod with RL-specific capabilities:
+    - Trajectory generation (student exploration via sampling)
+    - Reward computation (teacher evaluation of student's actions)
+    - Policy updates (RL algorithms like REINFORCE, PPO, DPO)
+    
+    Unlike supervised methods where teacher generates fixed responses and student
+    imitates them, RL methods have the student generate responses (exploration)
+    and receive feedback (rewards) from the teacher to improve its policy.
+    
+    :param teacher_model: Pre-trained teacher model (acts as evaluator/reward source)
+    :type teacher_model: nn.Module
+    :param student_model: Student model to be trained (the policy being optimized)
+    :type student_model: nn.Module
+    :param tokenizer: Tokenizer compatible with both models
+    :type tokenizer: TokenizerType
+    :param config: Configuration dictionary with RL-specific parameters:
+        - 'gamma' (float): Discount factor for future rewards (default 0.99)
+        - 'max_new_tokens' (int): Maximum tokens to generate (default 256)
+        - 'temperature' (float): Sampling temperature for exploration (default 1.0)
+    :type config: Dict[str, Any]
+    """
+    
+    gamma: float
+    max_new_tokens: int
+    temperature: float
+    
+    def __init__(
+        self,
+        teacher_model: nn.Module,
+        student_model: nn.Module,
+        tokenizer: TokenizerType,
+        config: Dict[str, Any]
+    ):
+        """Constructor"""
+        super().__init__(teacher_model, student_model, tokenizer, config)
+        
+        # RL-specific hyperparameters
+        self.gamma: float = config.get('gamma', 0.99)  # Discount factor
+        self.max_new_tokens: int = config.get('max_new_tokens', 256)
+        self.temperature: float = config.get('temperature', 1.0)  # Exploration temperature
+    
+    @abstractmethod
+    def generate_rollout(self, prompts: List[str]) -> Dict[str, torch.Tensor]:
+        """
+        Generate trajectory via student model's current policy with sampling.
+        
+        Student explores by sampling from its probability distribution rather than
+        greedy decoding. This enables diverse responses needed for RL training.
+        
+        :param prompts: List of text prompts to generate from
+        :type prompts: List[str]
+        :returns: Dictionary containing:
+            - 'sequences': Generated token sequences [batch, seq_len]
+            - 'log_probs': Log probabilities of sampled actions [batch, seq_len]
+            - 'full_sequences': Complete sequences including prompts [batch, full_len]
+            - 'prompt_lengths': Length of each prompt [batch]
+        :rtype: Dict[str, torch.Tensor]
+        """
+        pass
+    
+    @abstractmethod
+    def compute_rewards(
+        self, 
+        rollout: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        Compute rewards for generated trajectory using teacher as evaluator.
+        
+        Different RL methods compute rewards differently:
+        - On-Policy: Teacher's log-prob of student's actions
+        - BOND: Ranking among multiple samples
+        - SPIN: Implicit preference-based rewards
+        
+        :param rollout: Output from generate_rollout()
+        :type rollout: Dict[str, torch.Tensor]
+        :returns: Reward values [batch, seq_len] or [batch]
+        :rtype: torch.Tensor
+        """
+        pass
+    
+    @abstractmethod
+    def update_policy(
+        self,
+        rollout: Dict[str, torch.Tensor],
+        rewards: torch.Tensor
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Update student policy using RL algorithm (REINFORCE, PPO, DPO, etc.).
+        
+        Implements the policy gradient or preference optimization update rule
+        to make the student more likely to take high-reward actions.
+        
+        :param rollout: Generated trajectory with log probabilities
+        :type rollout: Dict[str, torch.Tensor]
+        :param rewards: Reward signal from compute_rewards()
+        :type rewards: torch.Tensor
+        :returns: Tuple of (policy loss for backprop, metrics dictionary)
+        :rtype: Tuple[torch.Tensor, Dict[str, float]]
+        """
+        pass
+    
+    def compute_loss(self, batch: BatchDict) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        RL-compatible loss computation. Overrides BaseDistillationMethod.compute_loss().
+        
+        Instead of supervised loss on fixed labels, this:
+        1. Generates rollouts (student exploration)
+        2. Computes rewards (teacher evaluation)
+        3. Updates policy (RL algorithm)
+        
+        :param batch: Input batch with prompts or input_ids
+        :type batch: BatchDict
+        :returns: Tuple of (policy loss, metrics dictionary)
+        :rtype: Tuple[torch.Tensor, Dict[str, float]]
+        """
+        # Extract prompts from batch
+        if 'prompts' in batch:
+            prompts = batch['prompts']
+        else:
+            # Decode from input_ids if needed
+            prompts = self.tokenizer.batch_decode(
+                batch['input_ids'],
+                skip_special_tokens=True
+            )
+        
+        # Step 1: Generate trajectory from current policy
+        rollout = self.generate_rollout(prompts)
+        
+        # Step 2: Compute rewards
+        rewards = self.compute_rewards(rollout)
+        
+        # Step 3: Update policy via RL algorithm
+        policy_loss, metrics = self.update_policy(rollout, rewards)
+        
+        return policy_loss, metrics
+    
+    def compute_discounted_rewards(self, rewards: torch.Tensor) -> torch.Tensor:
+        """
+        Compute discounted cumulative rewards for variance reduction.
+        
+        R_t = r_t + gamma * r_{t+1} + gamma^2 * r_{t+2} + ...
+        
+        :param rewards: Per-timestep rewards [batch, seq_len]
+        :type rewards: torch.Tensor
+        :returns: Discounted cumulative rewards [batch, seq_len]
+        :rtype: torch.Tensor
+        """
+        batch_size, seq_len = rewards.shape
+        discounted = torch.zeros_like(rewards)
+        
+        for t in reversed(range(seq_len)):
+            if t == seq_len - 1:
+                discounted[:, t] = rewards[:, t]
+            else:
+                discounted[:, t] = rewards[:, t] + self.gamma * discounted[:, t + 1]
+        
+        return discounted
+
+
+# ==============================================================================
+# RL METHOD 1: ON-POLICY DISTILLATION (REINFORCE)
+# ==============================================================================
+
+class OnPolicyDistillation(BaseRLDistillationMethod):
+    """
+    On-Policy Distillation using REINFORCE algorithm.
+    
+    Student generates responses token-by-token via sampling, and teacher evaluates
+    each token choice in real-time. Uses vanilla policy gradient (REINFORCE) to
+    increase probability of actions that received high rewards from teacher.
+    
+    **Reference**:
+    Agarwal et al. (2024) - On-Policy Distillation (related concept)
+    Williams, R. J. (1992) - Simple Statistical Gradient-Following Algorithms (REINFORCE)
+    
+    :param teacher_model: Teacher model (acts as reward function)
+    :type teacher_model: nn.Module
+    :param student_model: Student model (policy to optimize)
+    :type student_model: nn.Module
+    :param tokenizer: Shared tokenizer
+    :type tokenizer: TokenizerType
+    :param config: Configuration with optional 'gamma' (default 0.99), 'temperature' (default 1.0),
+        'max_new_tokens' (default 256), 'entropy_coef' (default 0.01 for exploration bonus)
+    :type config: Dict[str, Any]
+    """
+    
+    entropy_coef: float
+    
+    def __init__(
+        self,
+        teacher_model: nn.Module,
+        student_model: nn.Module,
+        tokenizer: TokenizerType,
+        config: Dict[str, Any]
+    ):
+        """Constructor"""
+        super().__init__(teacher_model, student_model, tokenizer, config)
+        self.entropy_coef: float = config.get('entropy_coef', 0.01)  # Entropy bonus for exploration
+        
+        print(f"Initialized {self.get_method_name()}")
+        print(f"  → Gamma (γ) = {self.gamma}")
+        print(f"  → Temperature = {self.temperature}")
+        print(f"  → Entropy coefficient = {self.entropy_coef}")
+        print(f"  → Max new tokens: {self.max_new_tokens}")
+    
+    def generate_rollout(self, prompts: List[str]) -> Dict[str, torch.Tensor]:
+        """
+        Generate trajectory by sampling from student's policy.
+        
+        Uses temperature-controlled sampling for exploration.
+        """
+        batch_size = len(prompts)
+        
+        # Tokenize prompts into input tensors
+        inputs = self.tokenizer(prompts, return_tensors='pt', padding=True)
+        input_ids = inputs['input_ids'].to(self.get_device())
+        attention_mask = inputs['attention_mask'].to(self.get_device())
+        prompt_lengths = attention_mask.sum(dim=1)  # Track where prompts end for reward computation later
+        
+        # Storage for trajectory - we collect each sampled token and its log probability
+        all_actions = []  # List of [batch, 1] tensors, one per generation step
+        all_log_probs = []  # List of [batch, 1] tensors, log π(a_t|s_t)
+        
+        # Generate token-by-token with sampling (NOT greedy decoding like supervised methods)
+        for step in range(self.max_new_tokens):
+            # Forward pass with gradient tracking (needed for policy gradient update later)
+            # Unlike supervised methods, we need gradients during generation
+            outputs = self.student_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
+            
+            next_token_logits = outputs.logits[:, -1, :]  # Extract logits for next token [batch, vocab_size]
+            
+            # Apply temperature for exploration - higher T = more random, lower T = more greedy
+            # Temperature scaling flattens/sharpens the distribution without changing argmax
+            scaled_logits = next_token_logits / self.temperature
+            
+            # Sample action from policy distribution (RL requires exploration!)
+            probs = F.softmax(scaled_logits, dim=-1)  # Convert logits to probability distribution
+            action = torch.multinomial(probs, num_samples=1)  # Sample one token [batch, 1]
+            
+            # Compute log probability of the chosen action for REINFORCE update
+            log_probs = F.log_softmax(scaled_logits, dim=-1)  # log π(·|s_t)
+            action_log_prob = log_probs.gather(1, action)  # Extract log π(a_t|s_t) for selected action
+            
+            # Store trajectory data for later policy update
+            all_actions.append(action)
+            all_log_probs.append(action_log_prob)
+            
+            # Update context for next generation step (autoregressive)
+            input_ids = torch.cat([input_ids, action], dim=1)  # Append generated token
+            attention_mask = torch.cat([
+                attention_mask,
+                torch.ones((batch_size, 1), dtype=attention_mask.dtype, device=self.get_device())
+            ], dim=1)  # Extend attention mask to include new token
+            
+            # Early stopping if all sequences generate EOS
+            if (action == self.tokenizer.eos_token_id).all():
+                break
+        
+        # Concatenate all timesteps into single tensors
+        sequences = torch.cat(all_actions, dim=1)  # [batch, seq_len] - generated tokens only
+        log_probs = torch.cat(all_log_probs, dim=1)  # [batch, seq_len] - log π(a|s) for each token
+        
+        return {
+            'sequences': sequences,  # Student's generated tokens
+            'log_probs': log_probs,  # Log probabilities under student policy
+            'full_sequences': input_ids,  # Prompt + generated tokens
+            'prompt_lengths': prompt_lengths  # Where prompt ends (for masking)
+        }
+    
+    def compute_rewards(self, rollout: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        Compute rewards as teacher's log probability of student's actions.
+        
+        High reward if teacher would have made the same choice.
+        """
+        full_sequences = rollout['full_sequences']  # Prompt + student generation
+        student_actions = rollout['sequences']  # Just the generated tokens
+        
+        with torch.no_grad():  # Don't backprop through reward computation
+            # Teacher evaluates the full sequence including student's choices
+            # Teacher sees what student generated and assigns quality score
+            teacher_outputs = self.teacher_model(
+                input_ids=full_sequences,
+                attention_mask=torch.ones_like(full_sequences)  # All tokens are valid (no padding)
+            )
+            teacher_logits = teacher_outputs.logits  # [batch, full_seq_len, vocab_size]
+            
+            # Get teacher's probability distribution over vocabulary at each position
+            teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
+            
+            # Extract teacher's log-prob for student's actual actions
+            # Due to autoregressive off-by-one: teacher_logits[:, t] predicts token at position t+1
+            # So teacher_logits[:, prompt_len-1:-1] aligns with student_actions
+            prompt_len = full_sequences.size(1) - student_actions.size(1)
+            relevant_teacher_logits = teacher_logits[:, prompt_len-1:-1, :]  # Slice to match student actions
+            
+            # Reward = log P_teacher(student's token | context)
+            # High reward when teacher would have made same choice as student
+            rewards = relevant_teacher_logits.log_softmax(dim=-1).gather(
+                dim=2,
+                index=student_actions.unsqueeze(-1)  # Gather teacher's log-prob for student's action
+            ).squeeze(-1)  # [batch, seq_len] - one reward per generated token
+        
+        return rewards
+    
+    def update_policy(
+        self,
+        rollout: Dict[str, torch.Tensor],
+        rewards: torch.Tensor
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        REINFORCE policy gradient update.
+        
+        Loss = -E[log π(a|s) * (R - baseline)]
+        """
+        log_probs = rollout['log_probs']  # [batch, seq_len] - log π(a_t|s_t) for each action
+        
+        # Compute discounted rewards: R_t = r_t + γ*r_{t+1} + γ²*r_{t+2} + ...
+        # This gives credit to early actions for future rewards
+        discounted_rewards = self.compute_discounted_rewards(rewards)
+        
+        # Use discounted rewards as advantages (simple baseline: no value function)
+        # Normalize advantages for training stability (prevents explosion/vanishing gradients)
+        advantages = discounted_rewards
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # Z-score normalization
+        
+        # REINFORCE policy gradient: ∇J = E[∇log π(a|s) * A(s,a)]
+        # We minimize negative expected return: -E[log π(a|s) * advantage]
+        # Detach advantages so we don't backprop through reward computation
+        policy_loss = -(log_probs * advantages.detach()).mean()
+        
+        # Optional: Add entropy bonus for exploration to prevent premature convergence
+        # Entropy = -Σ p(a) log p(a), higher entropy = more exploration
+        if self.entropy_coef > 0:
+            probs = torch.exp(log_probs)  # Convert log probabilities back to probabilities
+            entropy = -(probs * log_probs).sum(dim=-1).mean()  # Average entropy over batch and sequence
+            policy_loss = policy_loss - self.entropy_coef * entropy  # Subtract because we want to maximize entropy
+        
+        metrics = {
+            'policy_loss': policy_loss.item(),
+            'total_loss': policy_loss.item(),
+            'avg_reward': rewards.mean().item(),
+            'avg_advantage': advantages.mean().item(),
+            'avg_response_length': float(rollout['sequences'].size(1))
+        }
+        
+        return policy_loss, metrics
+    
+    def get_method_name(self) -> str:
+        """Return method identifier for logging."""
+        return f"On-Policy-RL (γ={self.gamma}, T={self.temperature})"
+
+
+# ==============================================================================
+# RL METHOD 2: PPO DISTILLATION
+# ==============================================================================
+
+class PPODistillation(BaseRLDistillationMethod):
+    """
+    Proximal Policy Optimization (PPO) for distillation.
+    
+    Extends on-policy distillation with clipped objective to prevent destructively
+    large policy updates. More stable than vanilla REINFORCE.
+    
+    **Reference**:
+    Schulman et al. (2017) - Proximal Policy Optimization Algorithms
+    https://arxiv.org/abs/1707.06347
+    
+    :param teacher_model: Teacher model (reward source)
+    :type teacher_model: nn.Module
+    :param student_model: Student model (policy)
+    :type student_model: nn.Module
+    :param tokenizer: Shared tokenizer
+    :type tokenizer: TokenizerType
+    :param config: Configuration with 'epsilon' (clip range, default 0.2), 'gamma',
+        'temperature', 'max_new_tokens', 'value_coef' (default 0.5), 'entropy_coef' (default 0.01)
+    :type config: Dict[str, Any]
+    """
+    
+    epsilon: float
+    value_coef: float
+    entropy_coef: float
+    
+    def __init__(
+        self,
+        teacher_model: nn.Module,
+        student_model: nn.Module,
+        tokenizer: TokenizerType,
+        config: Dict[str, Any]
+    ):
+        """Constructor"""
+        super().__init__(teacher_model, student_model, tokenizer, config)
+        self.epsilon: float = config.get('epsilon', 0.2)
+        self.value_coef: float = config.get('value_coef', 0.5)
+        self.entropy_coef: float = config.get('entropy_coef', 0.01)
+        
+        print(f"Initialized {self.get_method_name()}")
+        print(f"  → Epsilon (ε) = {self.epsilon}")
+        print(f"  → Gamma (γ) = {self.gamma}")
+        print(f"  → Temperature = {self.temperature}")
+        print(f"  → Value coef = {self.value_coef}")
+        print(f"  → Entropy coef = {self.entropy_coef}")
+    
+    def generate_rollout(self, prompts: List[str]) -> Dict[str, torch.Tensor]:
+        """Generate trajectory with sampling (same as OnPolicyDistillation)"""
+        batch_size = len(prompts)
+        
+        inputs = self.tokenizer(prompts, return_tensors='pt', padding=True)
+        input_ids = inputs['input_ids'].to(self.get_device())
+        attention_mask = inputs['attention_mask'].to(self.get_device())
+        prompt_lengths = attention_mask.sum(dim=1)
+        
+        all_actions = []
+        all_log_probs = []
+        
+        for step in range(self.max_new_tokens):
+            outputs = self.student_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
+            
+            next_token_logits = outputs.logits[:, -1, :]
+            scaled_logits = next_token_logits / self.temperature
+            
+            probs = F.softmax(scaled_logits, dim=-1)
+            action = torch.multinomial(probs, num_samples=1)
+            
+            log_probs = F.log_softmax(scaled_logits, dim=-1)
+            action_log_prob = log_probs.gather(1, action)
+            
+            all_actions.append(action)
+            all_log_probs.append(action_log_prob)
+            
+            input_ids = torch.cat([input_ids, action], dim=1)
+            attention_mask = torch.cat([
+                attention_mask,
+                torch.ones((batch_size, 1), dtype=attention_mask.dtype, device=self.get_device())
+            ], dim=1)
+            
+            if (action == self.tokenizer.eos_token_id).all():
+                break
+        
+        sequences = torch.cat(all_actions, dim=1)
+        log_probs = torch.cat(all_log_probs, dim=1)
+        
+        return {
+            'sequences': sequences,
+            'log_probs': log_probs,
+            'full_sequences': input_ids,
+            'prompt_lengths': prompt_lengths,
+            'old_log_probs': log_probs.detach()  # Store old policy's log-probs for computing PPO ratio
+        }
+    
+    def compute_rewards(self, rollout: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Compute rewards (same as OnPolicyDistillation)"""
+        full_sequences = rollout['full_sequences']  # Prompt + student generation
+        student_actions = rollout['sequences']  # Just the generated tokens
+        
+        with torch.no_grad():  # No gradients needed for reward computation
+            # Teacher evaluates student's trajectory
+            teacher_outputs = self.teacher_model(
+                input_ids=full_sequences,
+                attention_mask=torch.ones_like(full_sequences)
+            )
+            teacher_logits = teacher_outputs.logits  # [batch, full_seq_len, vocab_size]
+            
+            # Extract teacher log-probs for student's actions (handle autoregressive offset)
+            prompt_len = full_sequences.size(1) - student_actions.size(1)
+            relevant_teacher_logits = teacher_logits[:, prompt_len-1:-1, :]
+            
+            # Reward = log P_teacher(student's token | context)
+            rewards = relevant_teacher_logits.log_softmax(dim=-1).gather(
+                dim=2,
+                index=student_actions.unsqueeze(-1)
+            ).squeeze(-1)  # [batch, seq_len]
+        
+        return rewards
+    
+    def update_policy(
+        self,
+        rollout: Dict[str, torch.Tensor],
+        rewards: torch.Tensor
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        PPO clipped objective update.
+        
+        Prevents large policy updates via ratio clipping.
+        """
+        old_log_probs = rollout['old_log_probs']  # Log-probs from policy that generated rollout
+        sequences = rollout['sequences']  # Generated tokens
+        full_sequences = rollout['full_sequences']  # Prompt + generation
+        
+        # Re-evaluate the same actions with the CURRENT policy (after gradient updates)
+        # This is the key difference from REINFORCE - we compare old and new policies
+        current_outputs = self.student_model(
+            input_ids=full_sequences,
+            attention_mask=torch.ones_like(full_sequences)
+        )
+        current_logits = current_outputs.logits  # Current policy's logits [batch, full_seq, vocab]
+        
+        # Extract logits for generated tokens (handle autoregressive offset)
+        prompt_len = full_sequences.size(1) - sequences.size(1)
+        relevant_logits = current_logits[:, prompt_len-1:-1, :]  # Align with sequences
+        
+        # Compute log-probs under CURRENT policy for the actions we took
+        current_log_probs = F.log_softmax(relevant_logits / self.temperature, dim=-1).gather(
+            dim=2,
+            index=sequences.unsqueeze(-1)  # Extract log π_new(a|s) for each action
+        ).squeeze(-1)  # [batch, seq_len]
+        
+        # Compute advantages from rewards (same as REINFORCE)
+        discounted_rewards = self.compute_discounted_rewards(rewards)
+        advantages = (discounted_rewards - discounted_rewards.mean()) / (discounted_rewards.std() + 1e-8)
+        
+        # PPO clipped objective: prevents policy from changing too fast
+        # Ratio = π_new(a|s) / π_old(a|s) = exp(log π_new - log π_old)
+        ratio = torch.exp(current_log_probs - old_log_probs)  # How much policy changed
+        clipped_ratio = torch.clamp(ratio, 1.0 - self.epsilon, 1.0 + self.epsilon)  # Limit to [1-ε, 1+ε]
+        
+        # Take minimum of clipped and unclipped objectives (conservative update)
+        # If advantage > 0 (good action), we want to increase π(a|s), but not too much (ratio < 1+ε)
+        # If advantage < 0 (bad action), we want to decrease π(a|s), but not too much (ratio > 1-ε)
+        policy_loss_unclipped = ratio * advantages.detach()  # Standard policy gradient
+        policy_loss_clipped = clipped_ratio * advantages.detach()  # Clipped version
+        policy_loss = -torch.min(policy_loss_unclipped, policy_loss_clipped).mean()  # Pessimistic bound
+        
+        # Entropy bonus for exploration (prevents policy from collapsing)
+        probs = torch.exp(current_log_probs)
+        entropy = -(probs * current_log_probs).sum(dim=-1).mean()
+        
+        # Total loss: policy loss - entropy bonus (subtract because we maximize entropy)
+        total_loss = policy_loss - self.entropy_coef * entropy
+        
+        metrics = {
+            'policy_loss': policy_loss.item(),
+            'entropy': entropy.item(),
+            'total_loss': total_loss.item(),
+            'avg_reward': rewards.mean().item(),
+            'avg_ratio': ratio.mean().item(),  # Track how much policy is changing
+            'avg_response_length': float(sequences.size(1))
+        }
+        
+        return total_loss, metrics
+    
+    def get_method_name(self) -> str:
+        """Return method identifier for logging."""
+        return f"PPO (ε={self.epsilon}, γ={self.gamma})"
+
+
+# ==============================================================================
+# RL METHOD 3: BEST-OF-N DISTILLATION (BOND)
+# ==============================================================================
+
+class BestOfNDistillation(BaseRLDistillationMethod):
+    """
+    Best-of-N Distillation (BOND).
+    
+    Student generates N diverse samples per prompt, teacher ranks them, and student
+    learns to reproduce the best sample in a single pass. Distills the implicit
+    reward of "best-of-N sampling" into the student's policy.
+    
+    **Reference**:
+    Yang et al. (2024) - BOND: Aligning LLMs with Best-of-N Distillation
+    
+    :param teacher_model: Teacher model (scores/ranks samples)
+    :type teacher_model: nn.Module
+    :param student_model: Student model (generates N samples)
+    :type student_model: nn.Module
+    :param tokenizer: Shared tokenizer
+    :type tokenizer: TokenizerType
+    :param config: Configuration with 'num_samples' (N, default 16), 'temperature',
+        'max_new_tokens', 'use_ranking' (bool, default False for binary rewards)
+    :type config: Dict[str, Any]
+    """
+    
+    num_samples: int
+    use_ranking: bool
+    
+    def __init__(
+        self,
+        teacher_model: nn.Module,
+        student_model: nn.Module,
+        tokenizer: TokenizerType,
+        config: Dict[str, Any]
+    ):
+        """Constructor"""
+        super().__init__(teacher_model, student_model, tokenizer, config)
+        self.num_samples: int = config.get('num_samples', 16)  # N candidate samples to generate per prompt
+        self.use_ranking: bool = config.get('use_ranking', False)  # Optional: use full ranking instead of just best
+        
+        print(f"Initialized {self.get_method_name()}")
+        print(f"  → Num samples (N) = {self.num_samples}")
+        print(f"  → Temperature = {self.temperature}")
+        print(f"  → Use ranking: {self.use_ranking}")
+        print(f"  → Max new tokens: {self.max_new_tokens}")
+    
+    def generate_rollout(self, prompts: List[str]) -> Dict[str, torch.Tensor]:
+        """
+        Generate N diverse samples per prompt.
+        """
+        batch_size = len(prompts)
+        
+        # Storage for all N samples - we'll collect them separately and teacher will rank
+        all_samples = []  # Will be List of N tensors, each [batch, seq_len_i]
+        all_log_probs = []  # List of N tensors, each [batch, seq_len_i]
+        all_full_sequences = []  # List of N tensors, each [batch, full_len_i]
+        
+        # Generate N independent samples per prompt (memory intensive!)
+        for n in range(self.num_samples):
+            # Tokenize fresh each time to reset generation state
+            inputs = self.tokenizer(prompts, return_tensors='pt', padding=True)
+            input_ids = inputs['input_ids'].to(self.get_device())
+            attention_mask = inputs['attention_mask'].to(self.get_device())
+            prompt_lengths = attention_mask.sum(dim=1)  # Track prompt boundaries
+            
+            actions = []  # Tokens for this sample
+            log_probs_list = []  # Log-probs for this sample
+            
+            # Generate one complete sample via sampling
+            for step in range(self.max_new_tokens):
+                outputs = self.student_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask
+                )
+                
+                next_token_logits = outputs.logits[:, -1, :]  # [batch, vocab]
+                scaled_logits = next_token_logits / self.temperature  # Temperature for diversity
+                
+                # Sample action (each of N samples will be different due to randomness)
+                probs = F.softmax(scaled_logits, dim=-1)
+                action = torch.multinomial(probs, num_samples=1)  # [batch, 1]
+                
+                # Track log-prob for this choice
+                log_probs = F.log_softmax(scaled_logits, dim=-1)
+                action_log_prob = log_probs.gather(1, action)
+                
+                actions.append(action)
+                log_probs_list.append(action_log_prob)
+                
+                # Update context for next token
+                input_ids = torch.cat([input_ids, action], dim=1)
+                attention_mask = torch.cat([
+                    attention_mask,
+                    torch.ones((batch_size, 1), dtype=attention_mask.dtype, device=self.get_device())
+                ], dim=1)
+                
+                # Early stopping if all sequences hit EOS
+                if (action == self.tokenizer.eos_token_id).all():
+                    break
+            
+            # Concatenate this sample's tokens and log-probs
+            sample_seq = torch.cat(actions, dim=1) if actions else torch.zeros((batch_size, 0), device=self.get_device())
+            sample_log_probs = torch.cat(log_probs_list, dim=1) if log_probs_list else torch.zeros((batch_size, 0), device=self.get_device())
+            
+            all_samples.append(sample_seq)  # Store this sample
+            all_log_probs.append(sample_log_probs)  # Store its log-probs
+            all_full_sequences.append(input_ids)  # Store full sequence (prompt + sample)
+        
+        return {
+            'samples': all_samples,  # List of N tensors [batch, seq_len] - generated tokens for each sample
+            'log_probs': all_log_probs,  # List of N tensors [batch, seq_len] - log π(a|s) for each sample
+            'full_sequences': all_full_sequences,  # List of N tensors [batch, full_len] - prompt + generation
+            'num_samples': self.num_samples,
+            'prompt_lengths': prompt_lengths
+        }
+    
+    def compute_rewards(self, rollout: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Teacher scores all N samples and returns best indices.
+        """
+        samples = rollout['samples']  # List of N sample tensors
+        full_sequences = rollout['full_sequences']  # List of N full sequence tensors
+        batch_size = full_sequences[0].size(0)
+        
+        scores_per_sample = []  # Will collect teacher's score for each of N samples
+        
+        with torch.no_grad():  # Teacher evaluation doesn't need gradients
+            # Evaluate each of the N samples
+            for full_seq, sample_seq in zip(full_sequences, samples):
+                if sample_seq.size(1) == 0:
+                    # Empty sequence (shouldn't happen but handle gracefully)
+                    scores_per_sample.append(torch.full((batch_size,), float('-inf'), device=self.get_device()))
+                    continue
+                
+                # Teacher evaluates this sample by computing log-likelihood
+                teacher_outputs = self.teacher_model(
+                    input_ids=full_seq,
+                    attention_mask=torch.ones_like(full_seq)
+                )
+                teacher_logits = teacher_outputs.logits  # [batch, full_seq_len, vocab]
+                
+                # Compute score = average log probability under teacher (quality metric)
+                # Higher score = teacher thinks this is a better response
+                prompt_len = full_seq.size(1) - sample_seq.size(1)
+                relevant_logits = teacher_logits[:, prompt_len-1:-1, :]  # Align with sample tokens
+                
+                # Get teacher's log-prob for each token in this sample
+                token_log_probs = relevant_logits.log_softmax(dim=-1).gather(
+                    dim=2,
+                    index=sample_seq.unsqueeze(-1)
+                ).squeeze(-1)  # [batch, seq_len]
+                
+                # Average over sequence length to get overall quality score
+                avg_score = token_log_probs.mean(dim=1)  # [batch] - one score per batch element
+                scores_per_sample.append(avg_score)
+        
+        # Stack scores: [num_samples, batch] - each row is scores for one sample across batch
+        all_scores = torch.stack(scores_per_sample, dim=0)
+        
+        # Find best sample index for each batch element (argmax over samples dimension)
+        # best_indices[i] tells us which of the N samples was best for batch element i
+        best_indices = all_scores.argmax(dim=0)  # [batch]
+        
+        return {
+            'best_indices': best_indices,  # Which sample won for each batch element
+            'all_scores': all_scores  # Full score matrix for analysis
+        }
+    
+    def update_policy(
+        self,
+        rollout: Dict[str, torch.Tensor],
+        rewards: Dict[str, torch.Tensor]
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Learn to reproduce the best sample.
+        """
+        best_indices = rewards['best_indices']  # [batch] - which of N samples was best
+        all_scores = rewards['all_scores']  # [num_samples, batch] - all scores
+        
+        samples = rollout['samples']  # List of N sample tensors
+        log_probs_list = rollout['log_probs']  # List of N log-prob tensors
+        batch_size = best_indices.size(0)
+        
+        # Extract best sample for each batch element and train via supervised loss
+        # Unlike REINFORCE/PPO, BOND uses supervised learning on the winner
+        loss = 0.0
+        total_tokens = 0
+        
+        for b in range(batch_size):
+            # Find which sample won for this batch element
+            best_idx = best_indices[b].item()  # Integer in [0, N-1]
+            best_log_probs = log_probs_list[best_idx][b:b+1]  # Extract this batch element's log-probs [1, seq_len]
+            
+            if best_log_probs.size(1) > 0:  # Only if non-empty sequence
+                # Maximize log probability of the winning trajectory (supervised learning)
+                # We already have log π(a|s) from generation, so just maximize it
+                loss += -best_log_probs.mean()  # Negative because we minimize loss
+                total_tokens += best_log_probs.size(1)
+        
+        # Average loss over batch
+        loss = loss / batch_size if batch_size > 0 else torch.tensor(0.0, device=self.get_device())
+        
+        metrics = {
+            'policy_loss': loss.item() if isinstance(loss, torch.Tensor) else loss,
+            'total_loss': loss.item() if isinstance(loss, torch.Tensor) else loss,
+            'avg_best_score': all_scores.max(dim=0)[0].mean().item(),  # Average score of winners
+            'avg_worst_score': all_scores.min(dim=0)[0].mean().item(),  # Average score of losers
+            'score_range': (all_scores.max(dim=0)[0] - all_scores.min(dim=0)[0]).mean().item(),  # Diversity metric
+            'avg_response_length': total_tokens / batch_size if batch_size > 0 else 0.0
+        }
+        
+        return loss, metrics
+    
+    def get_method_name(self) -> str:
+        """Return method identifier for logging."""
+        return f"BOND (N={self.num_samples}, T={self.temperature})"
+
+
+# ==============================================================================
+# RL METHOD 4: SPIN (SELF-PLAY DISTILLATION)
+# ==============================================================================
+
+class SPINDistillation(BaseRLDistillationMethod):
+    """
+    Self-Play based INstruction optimization (SPIN).
+    
+    Iterative self-play where student's own generations become "dispreferred" examples
+    and teacher's generations are "preferred". Uses DPO-style preference optimization
+    without explicit reward model.
+    
+    **Reference**:
+    Chen et al. (2024a) - Self-Play Fine-Tuning Converts Weak Language Models to Strong
+    
+    :param teacher_model: Teacher model (generates preferred responses)
+    :type teacher_model: nn.Module
+    :param student_model: Student model (generates dispreferred responses, gets optimized)
+    :type student_model: nn.Module
+    :param tokenizer: Shared tokenizer
+    :type tokenizer: TokenizerType
+    :param config: Configuration with 'beta' (DPO temperature, default 0.1), 'temperature',
+        'max_new_tokens'
+    :type config: Dict[str, Any]
+    """
+    
+    beta: float
+    
+    def __init__(
+        self,
+        teacher_model: nn.Module,
+        student_model: nn.Module,
+        tokenizer: TokenizerType,
+        config: Dict[str, Any]
+    ):
+        """Constructor"""
+        super().__init__(teacher_model, student_model, tokenizer, config)
+        self.beta: float = config.get('beta', 0.1)  # DPO temperature for preference strength
+        
+        print(f"Initialized {self.get_method_name()}")
+        print(f"  → Beta (β) = {self.beta}")
+        print(f"  → Temperature = {self.temperature}")
+        print(f"  → Max new tokens: {self.max_new_tokens}")
+    
+    def generate_rollout(self, prompts: List[str]) -> Dict[str, torch.Tensor]:
+        """
+        Generate both student (dispreferred) and teacher (preferred) responses.
+        """
+        batch_size = len(prompts)
+        
+        # ===== STUDENT GENERATION (Dispreferred) =====
+        # Student samples from its current policy - these become the "losing" examples
+        inputs = self.tokenizer(prompts, return_tensors='pt', padding=True)
+        input_ids = inputs['input_ids'].to(self.get_device())
+        attention_mask = inputs['attention_mask'].to(self.get_device())
+        prompt_lengths = attention_mask.sum(dim=1)
+        
+        student_actions = []  # Student's sampled tokens
+        student_log_probs = []  # Log-probs for tracking
+        
+        # Generate student response token-by-token with sampling
+        for step in range(self.max_new_tokens):
+            outputs = self.student_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
+            
+            next_token_logits = outputs.logits[:, -1, :]  # [batch, vocab]
+            scaled_logits = next_token_logits / self.temperature  # Exploration temperature
+            
+            # Sample from student's policy (diverse responses)
+            probs = F.softmax(scaled_logits, dim=-1)
+            action = torch.multinomial(probs, num_samples=1)  # [batch, 1]
+            
+            # Track log-prob for this action
+            log_probs = F.log_softmax(scaled_logits, dim=-1)
+            action_log_prob = log_probs.gather(1, action)
+            
+            student_actions.append(action)
+            student_log_probs.append(action_log_prob)
+            
+            # Update context
+            input_ids = torch.cat([input_ids, action], dim=1)
+            attention_mask = torch.cat([
+                attention_mask,
+                torch.ones((batch_size, 1), dtype=attention_mask.dtype, device=self.get_device())
+            ], dim=1)
+            
+            # Early stopping
+            if (action == self.tokenizer.eos_token_id).all():
+                break
+        
+        # Concatenate student's generation
+        student_sequences = torch.cat(student_actions, dim=1) if student_actions else torch.zeros((batch_size, 0), device=self.get_device())
+        student_full = input_ids  # Prompt + student generation
+        
+        # ===== TEACHER GENERATION (Preferred) =====
+        # Teacher generates high-quality response - these become the "winning" examples
+        inputs_teacher = self.tokenizer(prompts, return_tensors='pt', padding=True)
+        input_ids_teacher = inputs_teacher['input_ids'].to(self.get_device())
+        attention_mask_teacher = inputs_teacher['attention_mask'].to(self.get_device())
+        
+        with torch.no_grad():  # Teacher doesn't get trained
+            teacher_full = self.teacher_model.generate(
+                input_ids=input_ids_teacher,
+                attention_mask=attention_mask_teacher,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,  # Teacher uses greedy decoding (high quality)
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id
+            )
+        
+        # Extract teacher's generated portion (remove prompt)
+        teacher_sequences = teacher_full[:, input_ids_teacher.size(1):]
+        
+        return {
+            'student_sequences': student_sequences,  # Student's generated tokens (dispreferred)
+            'student_full': student_full,  # Prompt + student generation
+            'teacher_sequences': teacher_sequences,  # Teacher's generated tokens (preferred)
+            'teacher_full': teacher_full,  # Prompt + teacher generation
+            'prompt_lengths': prompt_lengths
+        }
+    
+    def compute_rewards(self, rollout: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        For SPIN, rewards are implicit in DPO loss. Return rollout for update_policy.
+        """
+        # SPIN doesn't use explicit rewards - preference is implicit in DPO loss
+        # Just pass through the rollout data to update_policy
+        return rollout
+    
+    def update_policy(
+        self,
+        rollout: Dict[str, torch.Tensor],
+        rewards: Dict[str, torch.Tensor]
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        DPO-style preference optimization.
+        
+        Maximize margin between preferred (teacher) and dispreferred (student) responses.
+        """
+        student_full = rollout['student_full']  # Prompt + student's response
+        teacher_full = rollout['teacher_full']  # Prompt + teacher's response
+        student_sequences = rollout['student_sequences']  # Just student tokens
+        teacher_sequences = rollout['teacher_sequences']  # Just teacher tokens
+        
+        # Handle edge case of empty sequences
+        if student_sequences.size(1) == 0 or teacher_sequences.size(1) == 0:
+            return torch.tensor(0.0, device=self.get_device()), {
+                'dpo_loss': 0.0,
+                'total_loss': 0.0,
+                'margin': 0.0,
+                'accuracy': 0.0
+            }
+        
+        # ===== Compute log probs under CURRENT student policy =====
+        # We need student's probability for both its own response (dispreferred) and teacher's response (preferred)
+        
+        # Student evaluates its own generated response
+        student_outputs = self.student_model(
+            input_ids=student_full,  # Full sequence including prompt
+            attention_mask=torch.ones_like(student_full)
+        )
+        student_logits = student_outputs.logits  # [batch, student_full_len, vocab]
+        
+        # Student evaluates teacher's response (what teacher did)
+        teacher_outputs = self.student_model(  # Note: still student model evaluating
+            input_ids=teacher_full,  # Full sequence with teacher's response
+            attention_mask=torch.ones_like(teacher_full)
+        )
+        teacher_logits = teacher_outputs.logits  # [batch, teacher_full_len, vocab]
+        
+        # Compute sequence-level log probabilities (sum over tokens)
+        # For student's own response: log π_student(student_response | prompt)
+        prompt_len_student = student_full.size(1) - student_sequences.size(1)
+        student_log_prob = student_logits[:, prompt_len_student-1:-1, :].log_softmax(dim=-1).gather(
+            dim=2,
+            index=student_sequences.unsqueeze(-1)  # Extract log-prob for each actual token
+        ).squeeze(-1).sum(dim=1)  # Sum over sequence length → [batch]
+        
+        # For teacher's response: log π_student(teacher_response | prompt)
+        prompt_len_teacher = teacher_full.size(1) - teacher_sequences.size(1)
+        teacher_log_prob = teacher_logits[:, prompt_len_teacher-1:-1, :].log_softmax(dim=-1).gather(
+            dim=2,
+            index=teacher_sequences.unsqueeze(-1)  # Extract log-prob for each teacher token
+        ).squeeze(-1).sum(dim=1)  # Sum over sequence length → [batch]
+        
+        # ===== DPO Loss Computation =====
+        # DPO maximizes: log σ(β * (log π(y_w) - log π(y_l)))
+        # where y_w = preferred (teacher), y_l = dispreferred (student)
+        # We minimize negative of this
+        log_ratio = teacher_log_prob - student_log_prob  # How much better is teacher response?
+        dpo_loss = -F.logsigmoid(self.beta * log_ratio).mean()  # Maximize preference margin
+        
+        # ===== Metrics =====
+        margin = log_ratio.mean().item()  # Average log-prob difference (should increase over training)
+        accuracy = (log_ratio > 0).float().mean().item()  # Fraction where teacher > student
+        
+        metrics = {
+            'dpo_loss': dpo_loss.item(),
+            'total_loss': dpo_loss.item(),
+            'margin': margin,  # Positive = student prefers teacher response
+            'accuracy': accuracy,  # Fraction of examples where teacher is preferred
+            'avg_student_logprob': student_log_prob.mean().item(),
+            'avg_teacher_logprob': teacher_log_prob.mean().item()
+        }
+        
+        return dpo_loss, metrics
+    
+    def get_method_name(self) -> str:
+        """Return method identifier for logging."""
+        return f"SPIN (β={self.beta})"
 
 
 # ==============================================================================
@@ -920,7 +2316,9 @@ def create_distillation_method(
     """
     Factory function to instantiate distillation methods by name.
     
-    :param method_name: Method identifier ('sft', 'logit_kd', 'cot', 'dpo')
+    :param method_name: Method identifier. Supported methods:
+        - Supervised: 'sft', 'logit_kd', 'adakd', 'cot', 'fitnets', 'attention'
+        - RL-based: 'on_policy' (or 'reinforce'), 'ppo', 'bond' (or 'best_of_n'), 'spin' (or 'self_play')
     :type method_name: str
     :param teacher_model: Pre-trained teacher model
     :type teacher_model: nn.Module
@@ -931,10 +2329,20 @@ def create_distillation_method(
     :param config: Method-specific configuration dictionary. Required keys vary by method:
         - SFT: optional 'max_new_tokens' (default 256)
         - Logit-KD: 'alpha' (default 0.5), 'temperature' (default 3.0), optional 'max_new_tokens' (default 256)
-        - CoT: optional 'max_new_tokens' (default 512), optional 'cot_prompt' (default "Let's think step by step:"),
+        - AdaKD: 'alpha' (default 0.5), 'base_temperature' (default 3.0), 'min_temperature' (default 1.0),
+                 'max_temperature' (default 5.0), optional 'max_new_tokens' (default 256)
+        - CoT: optional 'max_new_tokens' (default 512), optional 'cot_prompt', 
                optional 'num_rationales' (default 1), optional 'sampling_temperature' (default 0.7)
-        - DPO: 'beta' (default 0.1). NOTE: DPO requires pre-collected preference pairs in batch
-               (see DirectPreferenceOptimization docstring for batch format)
+        - FitNets: 'alpha' (default 0.5), 'layer_mapping' (required), optional 'use_projections' (default True),
+                   optional 'max_new_tokens' (default 256)
+        - Attention: 'alpha' (default 0.5), 'layer_mapping' (required), optional 'match_all_heads' (default True),
+                     optional 'max_new_tokens' (default 256)
+        - On-Policy: 'max_new_tokens' (default 256), optional 'temperature' (default 1.0), 
+                     optional 'gamma' (default 0.99)
+        - PPO: 'max_new_tokens' (default 256), optional 'temperature' (default 1.0), optional 'gamma' (default 0.99),
+               optional 'clip_epsilon' (default 0.2), optional 'kl_penalty' (default 0.0)
+        - BOND: 'num_samples' (default 4), 'max_new_tokens' (default 256), optional 'temperature' (default 0.8)
+        - SPIN: 'max_new_tokens' (default 256), optional 'temperature' (default 1.0), optional 'beta' (default 0.1)
     :type config: Dict[str, Any]
     :returns: Instantiated distillation method
     :rtype: BaseDistillationMethod
@@ -954,16 +2362,80 @@ def create_distillation_method(
             {'alpha': 0.5, 'temperature': 3.0}
         )
         
+        # Token-Adaptive KD
+        adakd = create_distillation_method(
+            'adakd',
+            teacher,
+            student,
+            tokenizer,
+            {'alpha': 0.5, 'base_temperature': 3.0, 'min_temperature': 1.0, 'max_temperature': 5.0}
+        )
+        
         # Chain-of-Thought
         cot = create_distillation_method('cot', teacher, student, tokenizer, {})
         
-        # Direct Preference Optimization
-        dpo = create_distillation_method('dpo', teacher, student, tokenizer, {'beta': 0.1})
+        # FitNets with layer mapping
+        fitnets = create_distillation_method(
+            'fitnets',
+            teacher,
+            student,
+            tokenizer,
+            {'alpha': 0.5, 'layer_mapping': {6: 12, 12: 24}}
+        )
+        
+        # Attention Distillation
+        attention = create_distillation_method(
+            'attention',
+            teacher,
+            student,
+            tokenizer,
+            {'alpha': 0.5, 'layer_mapping': {6: 12}}
+        )
+        
+        # RL Methods
+        
+        # On-Policy Distillation (REINFORCE)
+        on_policy = create_distillation_method(
+            'on_policy',
+            teacher,
+            student,
+            tokenizer,
+            {'gamma': 0.99, 'temperature': 1.0}
+        )
+        
+        # PPO Distillation
+        ppo = create_distillation_method(
+            'ppo',
+            teacher,
+            student,
+            tokenizer,
+            {'epsilon': 0.2, 'gamma': 0.99}
+        )
+        
+        # BOND (Best-of-N)
+        bond = create_distillation_method(
+            'bond',
+            teacher,
+            student,
+            tokenizer,
+            {'num_samples': 16, 'temperature': 1.0}
+        )
+        
+        # SPIN (Self-Play)
+        spin = create_distillation_method(
+            'spin',
+            teacher,
+            student,
+            tokenizer,
+            {'beta': 0.1}
+        )
         
         # Compute loss
         loss, metrics = method.compute_loss(batch)
     """
     method_name = method_name.lower()
+    
+    # ===== SUPERVISED DISTILLATION METHODS =====
     
     if method_name in ('sft', 'standard_sft'):
         return StandardSFT(teacher_model, student_model, tokenizer, config)
@@ -971,14 +2443,35 @@ def create_distillation_method(
     elif method_name in ('logit_kd', 'logit'):
         return LogitKD(teacher_model, student_model, tokenizer, config)
     
+    elif method_name in ('adakd', 'token_adaptive_kd', 'token_adaptive'):
+        return TokenAdaptiveKD(teacher_model, student_model, tokenizer, config)
+    
     elif method_name in ('cot', 'chain_of_thought'):
         return ChainOfThoughtDistillation(teacher_model, student_model, tokenizer, config)
     
-    elif method_name in ('dpo', 'preference', 'direct_preference_optimization'):
-        return DirectPreferenceOptimization(teacher_model, student_model, tokenizer, config)
+    elif method_name in ('fitnets', 'intermediate_feature_matching', 'feature_matching'):
+        return IntermediateFeatureMatching(teacher_model, student_model, tokenizer, config)
+    
+    elif method_name in ('attention', 'attention_distillation', 'attention_transfer'):
+        return AttentionDistillation(teacher_model, student_model, tokenizer, config)
+    
+    # ===== RL-BASED DISTILLATION METHODS =====
+    
+    elif method_name in ('on_policy', 'on_policy_distillation', 'reinforce'):
+        return OnPolicyDistillation(teacher_model, student_model, tokenizer, config)
+    
+    elif method_name in ('ppo', 'ppo_distillation'):
+        return PPODistillation(teacher_model, student_model, tokenizer, config)
+    
+    elif method_name in ('bond', 'best_of_n', 'best_of_n_distillation'):
+        return BestOfNDistillation(teacher_model, student_model, tokenizer, config)
+    
+    elif method_name in ('spin', 'self_play', 'spin_distillation'):
+        return SPINDistillation(teacher_model, student_model, tokenizer, config)
     
     else:
         raise ValueError(
             f"Unknown distillation method: {method_name}. "
-            f"Choose from: ['sft', 'logit_kd', 'cot', 'dpo']"
+            f"Supervised: ['sft', 'logit_kd', 'adakd', 'cot', 'fitnets', 'attention']. "
+            f"RL-based: ['on_policy', 'ppo', 'bond', 'spin']"
         )
