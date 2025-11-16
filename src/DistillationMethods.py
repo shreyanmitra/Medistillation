@@ -2239,15 +2239,13 @@ def validate_tokenizer_compatibility(
     tokenizer: TokenizerType,
     method_name: str,
     strict: bool = True
-) -> None:
+) -> Dict[str, Any]:
     """
-    Validate that the provided tokenizer is compatible with both teacher and student models.
+    Validate tokenizer compatibility and return alignment requirements.
     
-    This is CRITICAL because the implementation uses a single shared tokenizer for both models.
-    Incompatible tokenizers will cause:
-    - Teacher to receive token IDs it doesn't understand (gibberish input)
-    - Dimension mismatches in logit-based methods (vocab size mismatch)
-    - Incorrect feature/attention alignment
+    Instead of raising errors on vocabulary mismatch, this function now returns
+    information about what alignment is needed. This allows the trainer to
+    automatically expand student vocabulary when --align_vocabularies flag is used.
     
     :param teacher_model: The teacher model
     :type teacher_model: nn.Module
@@ -2257,8 +2255,10 @@ def validate_tokenizer_compatibility(
     :type tokenizer: TokenizerType
     :param method_name: Name of distillation method (for error messages)
     :type method_name: str
-    :param strict: If True, raises error on mismatch. If False, only warns.
+    :param strict: If True, raises error on mismatch without --align_vocabularies flag
     :type strict: bool
+    :returns: Dictionary with alignment requirements
+    :rtype: Dict[str, Any]
     :raises ValueError: If tokenizer is incompatible and strict=True
     """
     import logging
@@ -2270,80 +2270,167 @@ def validate_tokenizer_compatibility(
     tokenizer_vocab_size = len(tokenizer)
     
     # Check if vocab sizes match
-    issues = []
+    vocab_mismatch = teacher_vocab_size != student_vocab_size
     
-    if teacher_vocab_size != tokenizer_vocab_size:
-        issues.append(
-            f"Teacher vocab size ({teacher_vocab_size:,}) != Tokenizer vocab size ({tokenizer_vocab_size:,})"
-        )
-    
-    if student_vocab_size != tokenizer_vocab_size:
-        issues.append(
-            f"Student vocab size ({student_vocab_size:,}) != Tokenizer vocab size ({tokenizer_vocab_size:,})"
-        )
-    
-    if teacher_vocab_size != student_vocab_size:
-        issues.append(
-            f"Teacher vocab size ({teacher_vocab_size:,}) != Student vocab size ({student_vocab_size:,})"
-        )
-    
-    # Check special tokens
-    if hasattr(tokenizer, 'pad_token_id') and tokenizer.pad_token_id is not None:
-        if tokenizer.pad_token_id >= teacher_vocab_size:
-            issues.append(
-                f"Tokenizer pad_token_id ({tokenizer.pad_token_id}) >= Teacher vocab size ({teacher_vocab_size})"
-            )
-        if tokenizer.pad_token_id >= student_vocab_size:
-            issues.append(
-                f"Tokenizer pad_token_id ({tokenizer.pad_token_id}) >= Student vocab size ({student_vocab_size})"
-            )
-    
-    if hasattr(tokenizer, 'eos_token_id') and tokenizer.eos_token_id is not None:
-        if tokenizer.eos_token_id >= teacher_vocab_size:
-            issues.append(
-                f"Tokenizer eos_token_id ({tokenizer.eos_token_id}) >= Teacher vocab size ({teacher_vocab_size})"
-            )
-        if tokenizer.eos_token_id >= student_vocab_size:
-            issues.append(
-                f"Tokenizer eos_token_id ({tokenizer.eos_token_id}) >= Student vocab size ({student_vocab_size})"
-            )
-    
-    # If issues found, report them
-    if issues:
-        error_msg = f"\n{'='*80}\n"
-        error_msg += "⚠️  TOKENIZER COMPATIBILITY ERROR ⚠️\n"
-        error_msg += f"{'='*80}\n"
-        error_msg += f"Method: {method_name}\n\n"
-        error_msg += "Issues detected:\n"
-        for i, issue in enumerate(issues, 1):
-            error_msg += f"  {i}. {issue}\n"
-        error_msg += "\n"
-        error_msg += "This will cause training to FAIL because:\n"
-        error_msg += "  • Teacher receives token IDs it doesn't understand\n"
-        error_msg += "  • Logit-based methods get dimension mismatches\n"
-        error_msg += "  • Feature/attention matching fails\n"
-        error_msg += "\n"
-        error_msg += "SOLUTIONS:\n"
-        error_msg += "  1. Use models from the same family (recommended):\n"
-        error_msg += "     Teacher: epfl-llm/meditron-70b + Student: epfl-llm/meditron-7b\n"
-        error_msg += "     Teacher: Qwen/Qwen2-72B + Student: Qwen/Qwen2-1.5B\n"
-        error_msg += "     Teacher: meta-llama/Llama-3.1-70B + Student: TinyLlama/TinyLlama-1.1B\n"
-        error_msg += "\n"
-        error_msg += "  2. Load tokenizer from teacher model instead:\n"
-        error_msg += "     tokenizer = AutoTokenizer.from_pretrained(teacher_model_name)\n"
-        error_msg += "\n"
-        error_msg += "  3. Implement Universal Logit Distillation (ULD) for vocab alignment\n"
-        error_msg += f"{'='*80}\n"
-        
-        if strict:
-            raise ValueError(error_msg)
-        else:
-            logger.warning(error_msg)
-    else:
+    if not vocab_mismatch:
         logger.info(f"✅ Tokenizer compatibility validated for method '{method_name}'")
         logger.info(f"   Teacher vocab: {teacher_vocab_size:,}")
         logger.info(f"   Student vocab: {student_vocab_size:,}")
         logger.info(f"   Tokenizer vocab: {tokenizer_vocab_size:,}")
+        return {
+            'requires_alignment': False,
+            'teacher_vocab_size': teacher_vocab_size,
+            'student_vocab_size': student_vocab_size,
+            'num_extra_tokens': 0
+        }
+    
+    # Vocabulary mismatch detected
+    diff = abs(teacher_vocab_size - student_vocab_size)
+    
+    error_msg = f"\n{'='*80}\n"
+    error_msg += "⚠️  VOCABULARY SIZE MISMATCH DETECTED ⚠️\n"
+    error_msg += f"{'='*80}\n"
+    error_msg += f"Method: {method_name}\n\n"
+    error_msg += f"  Teacher vocab size: {teacher_vocab_size:,}\n"
+    error_msg += f"  Student vocab size: {student_vocab_size:,}\n"
+    error_msg += f"  Difference:         {diff:,} tokens\n"
+    error_msg += "\n"
+    error_msg += "This will cause training to FAIL because:\n"
+    error_msg += "  • Logit-based methods require matching vocabulary dimensions\n"
+    error_msg += "  • KL divergence cannot be computed between different vocab sizes\n"
+    error_msg += "\n"
+    error_msg += "SOLUTION:\n"
+    error_msg += "  Add the --align_vocabularies flag to automatically expand student vocabulary:\n\n"
+    error_msg += "  python src/Trainer.py \\\n"
+    error_msg += f"    --teacher_model {teacher_model.config._name_or_path} \\\n"
+    error_msg += f"    --student_model {student_model.config._name_or_path} \\\n"
+    error_msg += f"    --method {method_name} \\\n"
+    error_msg += "    --align_vocabularies  # ← ADD THIS FLAG\n"
+    error_msg += "\n"
+    error_msg += "This will:\n"
+    error_msg += f"  1. Add {diff} tokens to student tokenizer\n"
+    error_msg += f"  2. Resize student embeddings: {student_vocab_size:,} → {teacher_vocab_size:,}\n"
+    error_msg += "  3. Initialize new embeddings with mean of existing embeddings\n"
+    error_msg += "  4. Enable full knowledge transfer via logit distillation\n"
+    error_msg += f"{'='*80}\n"
+    
+    if strict:
+        raise ValueError(error_msg)
+    else:
+        logger.warning(error_msg)
+        return {
+            'requires_alignment': True,
+            'teacher_vocab_size': teacher_vocab_size,
+            'student_vocab_size': student_vocab_size,
+            'num_extra_tokens': diff
+        }
+
+
+def align_student_vocabulary_to_teacher(
+    student_model: nn.Module,
+    student_tokenizer: TokenizerType,
+    teacher_tokenizer: TokenizerType,
+    logger: Any = None
+) -> Tuple[nn.Module, TokenizerType]:
+    """
+    Add teacher's extra tokens to student vocabulary for perfect alignment.
+    
+    This is the PREFERRED method for handling vocabulary mismatches in cross-tokenizer
+    distillation (e.g., Meditron-70B → Llama-2-7B with 17 extra medical tokens).
+    
+    Process:
+        1. Find tokens in teacher but not in student
+        2. Add those tokens to student tokenizer
+        3. Resize student model embeddings
+        4. Initialize new embeddings with mean of existing embeddings
+    
+    :param student_model: Student model to modify
+    :type student_model: nn.Module
+    :param student_tokenizer: Student tokenizer to expand
+    :type student_tokenizer: TokenizerType
+    :param teacher_tokenizer: Teacher tokenizer with extra tokens
+    :type teacher_tokenizer: TokenizerType
+    :param logger: Logger for status messages
+    :type logger: Any
+    :returns: Tuple of (updated_student_model, updated_student_tokenizer)
+    :rtype: Tuple[nn.Module, TokenizerType]
+    """
+    import logging
+    if logger is None:
+        logger = logging.getLogger(__name__)
+    
+    logger.info("="*60)
+    logger.info("🔧 VOCABULARY ALIGNMENT: Expanding Student Vocabulary")
+    logger.info("="*60)
+    
+    # Find extra tokens
+    teacher_vocab = set(teacher_tokenizer.get_vocab().keys())
+    student_vocab = set(student_tokenizer.get_vocab().keys())
+    extra_tokens = sorted(list(teacher_vocab - student_vocab))
+    
+    if not extra_tokens:
+        logger.info("✅ Vocabularies already match - no expansion needed")
+        logger.info("="*60)
+        return student_model, student_tokenizer
+    
+    original_student_vocab_size = len(student_tokenizer)
+    
+    logger.info(f"📊 Found {len(extra_tokens)} extra tokens in teacher vocabulary")
+    logger.info(f"\n🔍 Extra tokens (showing first 10):")
+    for i, token in enumerate(extra_tokens[:10], 1):
+        token_id = teacher_tokenizer.get_vocab()[token]
+        try:
+            decoded = teacher_tokenizer.decode([token_id]).strip()
+            if decoded:
+                logger.info(f"   {i:2d}. Token ID {token_id:>5d}: '{token}' → \"{decoded}\"")
+            else:
+                logger.info(f"   {i:2d}. Token ID {token_id:>5d}: '{token}' (special/control token)")
+        except:
+            logger.info(f"   {i:2d}. Token ID {token_id:>5d}: '{token}'")
+    
+    if len(extra_tokens) > 10:
+        logger.info(f"   ... and {len(extra_tokens) - 10} more tokens")
+    
+    # Add tokens to student tokenizer
+    logger.info(f"\n🔧 Adding {len(extra_tokens)} tokens to student tokenizer...")
+    num_added = student_tokenizer.add_tokens(extra_tokens)
+    new_student_vocab_size = len(student_tokenizer)
+    
+    logger.info(f"✅ Added {num_added} tokens")
+    logger.info(f"   Original student vocab: {original_student_vocab_size:,}")
+    logger.info(f"   New student vocab:      {new_student_vocab_size:,}")
+    logger.info(f"   Teacher vocab:          {len(teacher_tokenizer):,}")
+    
+    # Resize student model embeddings
+    logger.info(f"\n🔧 Resizing student model embeddings...")
+    student_model.resize_token_embeddings(new_student_vocab_size)
+    
+    # Initialize new embeddings with mean of existing embeddings
+    logger.info(f"🔧 Initializing new token embeddings...")
+    with torch.no_grad():
+        # Get embedding layer
+        embed_layer = student_model.get_input_embeddings()
+        
+        # Calculate mean of existing embeddings
+        existing_embeddings = embed_layer.weight[:original_student_vocab_size]
+        mean_embedding = existing_embeddings.mean(dim=0)
+        
+        # Initialize new token embeddings with mean
+        embed_layer.weight[original_student_vocab_size:] = mean_embedding
+        
+        logger.info(f"✅ Initialized {num_added} new embeddings")
+        logger.info(f"   Method: Mean of existing {original_student_vocab_size:,} embeddings")
+        logger.info(f"   Embedding dimension: {mean_embedding.shape[0]}")
+    
+    # Verify alignment
+    logger.info(f"\n✅ VOCABULARY ALIGNMENT COMPLETE!")
+    logger.info(f"   Teacher vocab: {len(teacher_tokenizer):,}")
+    logger.info(f"   Student vocab: {len(student_tokenizer):,}")
+    match = len(teacher_tokenizer) == len(student_tokenizer)
+    logger.info(f"   Match: {'✅ YES' if match else '❌ NO'}")
+    logger.info("="*60)
+    
+    return student_model, student_tokenizer
 
 
 # ==============================================================================

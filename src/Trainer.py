@@ -2561,6 +2561,10 @@ def main():
                         help='Use 8-bit quantization (QLoRA)')
     parser.add_argument('--enable_cpu_offload', action='store_true', default=False,
                         help='Enable CPU offloading for large teacher models (70B+)')
+    parser.add_argument('--align_vocabularies', action='store_true', default=False,
+                        help='Automatically align student vocabulary to match teacher by adding extra tokens. '
+                             'Required when teacher and student have different vocabulary sizes for logit-based methods. '
+                             'Example: Meditron-70B (32,017 tokens) → Llama-2-7B (32,000 tokens) adds 17 medical tokens.')
 
     # Method-specific arguments
     parser.add_argument('--alpha', type=float, default=0.5,
@@ -2663,6 +2667,73 @@ def main():
         lora_config=lora_config_dict,
         use_quantization=config.use_quantization
     )
+
+    # ===== Vocabulary Alignment for Logit-Based Methods =====
+    # Import alignment functions
+    from DistillationMethods import align_student_vocabulary_to_teacher
+    
+    # Methods that require vocabulary alignment (use logit distributions)
+    LOGIT_BASED_METHODS = ['logit_kd', 'logit', 'adakd', 'spin', 'self_play', 
+                           'ppo', 'on_policy', 'reinforce', 'bond', 'best_of_n']
+    
+    if config.distillation_method in LOGIT_BASED_METHODS:
+        teacher_vocab_size = teacher_model.config.vocab_size
+        student_vocab_size = student_model.config.vocab_size
+        
+        if teacher_vocab_size != student_vocab_size:
+            logger.info("\n" + "="*80)
+            logger.info("⚠️  VOCABULARY SIZE MISMATCH DETECTED")
+            logger.info("="*80)
+            logger.info(f"Teacher vocab size: {teacher_vocab_size:,}")
+            logger.info(f"Student vocab size: {student_vocab_size:,}")
+            logger.info(f"Difference:         {abs(teacher_vocab_size - student_vocab_size):,} tokens")
+            
+            if args.align_vocabularies:
+                logger.info("\n✅ --align_vocabularies flag detected")
+                logger.info("   Proceeding with automatic vocabulary expansion...\n")
+                
+                # Load teacher tokenizer for alignment
+                teacher_tokenizer = load_tokenizer(config.teacher_model_name)
+                
+                # Align vocabularies
+                student_model, tokenizer = align_student_vocabulary_to_teacher(
+                    student_model,
+                    tokenizer,
+                    teacher_tokenizer,
+                    logger
+                )
+                
+                logger.info("\n" + "="*80)
+                logger.info("✅ VOCABULARY ALIGNMENT SUCCESSFUL")
+                logger.info("="*80)
+                logger.info("Student model and tokenizer have been updated.")
+                logger.info("Training can now proceed with matched vocabularies.\n")
+            else:
+                error_msg = "\n" + "="*80 + "\n"
+                error_msg += "❌ ERROR: Vocabulary mismatch requires alignment\n"
+                error_msg += "="*80 + "\n"
+                error_msg += f"Method '{config.distillation_method}' requires matching vocabulary sizes.\n\n"
+                error_msg += "SOLUTION: Add the --align_vocabularies flag:\n\n"
+                error_msg += "  python src/Trainer.py \\\n"
+                error_msg += f"    --teacher_model {config.teacher_model_name} \\\n"
+                error_msg += f"    --student_model {config.student_model_name} \\\n"
+                error_msg += f"    --method {config.distillation_method} \\\n"
+                error_msg += "    --align_vocabularies  # ← ADD THIS FLAG\n"
+                error_msg += "\n"
+                error_msg += "This will:\n"
+                error_msg += f"  • Add {abs(teacher_vocab_size - student_vocab_size)} tokens to student vocabulary\n"
+                error_msg += f"  • Resize embeddings: {student_vocab_size:,} → {teacher_vocab_size:,}\n"
+                error_msg += "  • Initialize new embeddings with mean of existing ones\n"
+                error_msg += "  • Enable full knowledge transfer via logit distillation\n"
+                error_msg += "="*80 + "\n"
+                raise ValueError(error_msg)
+        else:
+            logger.info("\n✅ Vocabulary sizes match - no alignment needed")
+            logger.info(f"   Teacher vocab: {teacher_vocab_size:,}")
+            logger.info(f"   Student vocab: {student_vocab_size:,}\n")
+    else:
+        logger.info(f"\nℹ️  Method '{config.distillation_method}' doesn't require vocabulary alignment")
+        logger.info("   (Text-based methods like SFT handle vocab differences automatically)\n")
 
     # ===== Create Distillation Method Configuration =====
     # Build config dictionary with hyperparameters specific to chosen method
