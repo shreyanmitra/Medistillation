@@ -31,258 +31,273 @@ logger = logging.getLogger(__name__)
 
 
 # ==============================================================================
-# DATASET CLASS - MedMCQA Medical Question-Answering
+# LEGACY DATASET CLASS - MedMCQA Medical Question-Answering (DEPRECATED)
+# ==============================================================================
+# NOTE: This class is deprecated in favor of UniversalMedicalDataset which handles
+# multiple formats (MedMCQA, MedQA, PubMedQA, PubHealth) through auto-detection.
+# Kept for backward compatibility only.
 # ==============================================================================
 
-class MedMcqaDataset(Dataset):
-    """
-    Dataset class for MedMCQA medical question-answering data.
-    
-    Supports multiple data formats and can be configured for different distillation methods.
-    Handles both single-choice and multi-choice questions from the MedMCQA dataset.
-    
-    :param data_path: Path to the JSON data file
-    :type data_path: str
-    :param tokenizer: HuggingFace tokenizer for text processing
-    :type tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast]
-    :param max_length: Maximum sequence length for tokenization
-    :type max_length: int
-    :param distillation_method: Type of distillation method ('sft', 'logit_kd', 'cot', 'dpo')
-    :type distillation_method: str
-    :param cot_prompt: Chain-of-thought prompt for CoT distillation
-    :type cot_prompt: str
-    :param num_rationales: Number of diverse rationales for CoT (if > 1)
-    :type num_rationales: int
-    :param sampling_temperature: Temperature for diverse generation in CoT
-    :type sampling_temperature: float
-    """
-    
-    def __init__(
-        self,
-        data_path: str,
-        tokenizer: Union['PreTrainedTokenizer', 'PreTrainedTokenizerFast'],
-        max_length: int = 512,
-        distillation_method: str = 'sft',
-        cot_prompt: str = "Let's think step by step:",
-        num_rationales: int = 1,
-        sampling_temperature: float = 0.7,
-        **kwargs  # noqa: F841
-    ):
-        self.data_path = data_path
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.distillation_method = distillation_method.lower()
-        self.cot_prompt = cot_prompt
-        self.num_rationales = num_rationales
-        self.sampling_temperature = sampling_temperature
-        
-        # Load data
-        self.data = self._load_data()
-        logger.info("Loaded %d examples from %s", len(self.data), data_path)
-        logger.info("Distillation method: %s", self.distillation_method)
-        
-        # Validate distillation method
-        valid_methods = ['sft', 'logit_kd', 'cot', 'dpo']
-        if self.distillation_method not in valid_methods:
-            raise ValueError(f"Invalid distillation method: {self.distillation_method}. "
-                           f"Choose from: {valid_methods}")
-    
-    def _load_data(self) -> List[Dict[str, Any]]:
-        """
-        Load data from JSON file.
-        
-        :returns: List of data items from the dataset
-        :rtype: List[Dict[str, Any]]
-        """
-        try:
-            with open(self.data_path, 'r', encoding='utf-8') as f:
-                data = []
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        data.append(json.loads(line))
-                return data
-        except Exception as e:
-            logger.error("Error loading data from %s: %s", self.data_path, e)
-            raise
-    
-    def _format_question(self, item: Dict[str, Any]) -> str:
-        """
-        Format a single question with options.
-        
-        :param item: Single data item from the dataset
-        :type item: Dict[str, Any]
-        :returns: Formatted question string
-        :rtype: str
-        """
-        question = item['question']
-        options = [
-            f"A) {item['opa']}",
-            f"B) {item['opb']}",
-            f"C) {item['opc']}",
-            f"D) {item['opd']}"
-        ]
-        
-        formatted_question = f"Question: {question}\n\nOptions:\n" + "\n".join(options)
-        return formatted_question
-    
-    def _get_correct_answer(self, item: Dict[str, Any]) -> str:
-        """
-        Get the correct answer text for a question.
-        
-        :param item: Single data item from the dataset
-        :type item: Dict[str, Any]
-        :returns: Correct answer text
-        :rtype: str
-        """
-        cop = item['cop']
-        option_map = {1: 'opa', 2: 'opb', 3: 'opc', 4: 'opd'}
-        return item[option_map[cop]]
-    
-    def _create_response(self, item: Dict[str, Any], include_explanation: bool = True) -> str:
-        """
-        Create a response for the question.
-        
-        For standard distillation methods (SFT, Logit-KD), the teacher will generate
-        responses online during training. This method creates a simple placeholder
-        that includes the explanation if available.
-        
-        :param item: Single data item from the dataset
-        :type item: Dict[str, Any]
-        :param include_explanation: Whether to include the explanation
-        :type include_explanation: bool
-        :returns: Formatted response string
-        :rtype: str
-        """
-        correct_answer = self._get_correct_answer(item)
-        response = f"The correct answer is: {correct_answer}"
-        
-        if include_explanation and item.get('exp') and item['exp'] != 'null':
-            response += f"\n\nExplanation: {item['exp']}"
-        
-        return response
-    
-    def __len__(self) -> int:
-        """
-        Return the number of examples in the dataset.
-        
-        :returns: Total number of examples
-        :rtype: int
-        """
-        return len(self.data)
-    
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        """
-        Get a single example from the dataset.
-        
-        Note: For all distillation methods, teacher responses are generated
-        online during training. This method returns basic question/response
-        format with ground truth for reference.
-        
-        :param idx: Index of the example
-        :type idx: int
-        :returns: Dictionary containing the example data
-        :rtype: Dict[str, Any]
-        """
-        item = self.data[idx]
-        
-        # Format the question
-        question = self._format_question(item)
-        
-        # For all methods, create standard response
-        # Teacher will generate actual responses online during training
-        response = self._create_response(item)
-        
-        return {
-            'question': question,
-            'response': response,
-            'correct_answer': self._get_correct_answer(item),
-            'explanation': item.get('exp', ''),
-            'subject': item.get('subject_name', ''),
-            'topic': item.get('topic_name', ''),
-            'id': item.get('id', '')
-        }
+# class MedMcqaDataset(Dataset):
+#     """
+#     DEPRECATED: Use UniversalMedicalDataset instead.
+#     
+#     Dataset class for MedMCQA medical question-answering data.
+#     
+#     This class only works with MedMCQA format and will fail on other formats.
+#     
+#     :param data_path: Path to the JSON data file
+#     :type data_path: str
+#     :param tokenizer: HuggingFace tokenizer for text processing
+#     :type tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast]
+#     :param max_length: Maximum sequence length for tokenization
+#     :type max_length: int
+#     :param distillation_method: Type of distillation method ('sft', 'logit_kd', 'cot', 'dpo')
+#     :type distillation_method: str
+#     :param cot_prompt: Chain-of-thought prompt for CoT distillation
+#     :type cot_prompt: str
+#     :param num_rationales: Number of diverse rationales for CoT (if > 1)
+#     :type num_rationales: int
+#     :param sampling_temperature: Temperature for diverse generation in CoT
+#     :type sampling_temperature: float
+#     """
+#     
+#     def __init__(
+#         self,
+#         data_path: str,
+#         tokenizer: Union['PreTrainedTokenizer', 'PreTrainedTokenizerFast'],
+#         max_length: int = 512,
+#         distillation_method: str = 'sft',
+#         cot_prompt: str = "Let's think step by step:",
+#         num_rationales: int = 1,
+#         sampling_temperature: float = 0.7,
+#         **kwargs  # noqa: F841
+#     ):
+#         self.data_path = data_path
+#         self.tokenizer = tokenizer
+#         self.max_length = max_length
+#         self.distillation_method = distillation_method.lower()
+#         self.cot_prompt = cot_prompt
+#         self.num_rationales = num_rationales
+#         self.sampling_temperature = sampling_temperature
+#         
+#         # Load data
+#         self.data = self._load_data()
+#         logger.info("Loaded %d examples from %s", len(self.data), data_path)
+#         logger.info("Distillation method: %s", self.distillation_method)
+#         
+#         # Validate distillation method
+#         valid_methods = ['sft', 'logit_kd', 'cot', 'dpo']
+#         if self.distillation_method not in valid_methods:
+#             raise ValueError(f"Invalid distillation method: {self.distillation_method}. "
+#                            f"Choose from: {valid_methods}")
+#     
+#     def _load_data(self) -> List[Dict[str, Any]]:
+#         """
+#         Load data from JSON file.
+#         
+#         :returns: List of data items from the dataset
+#         :rtype: List[Dict[str, Any]]
+#         """
+#         try:
+#             with open(self.data_path, 'r', encoding='utf-8') as f:
+#                 data = []
+#                 for line in f:
+#                     line = line.strip()
+#                     if line:
+#                         data.append(json.loads(line))
+#                 return data
+#         except Exception as e:
+#                 for line in f:
+#                     line = line.strip()
+#                     if line:
+#                         data.append(json.loads(line))
+#                 return data
+#         except Exception as e:
+#             logger.error("Error loading data from %s: %s", self.data_path, e)
+#             raise
+#     
+#     def _format_question(self, item: Dict[str, Any]) -> str:
+#         """
+#         Format a single question with options (MedMCQA-specific).
+#         
+#         :param item: Single data item from the dataset
+#         :type item: Dict[str, Any]
+#         :returns: Formatted question string
+#         :rtype: str
+#         """
+#         question = item['question']
+#         options = [
+#             f"A) {item['opa']}",
+#             f"B) {item['opb']}",
+#             f"C) {item['opc']}",
+#             f"D) {item['opd']}"
+#         ]
+#         
+#         formatted_question = f"Question: {question}\n\nOptions:\n" + "\n".join(options)
+#         return formatted_question
+#     
+#     def _get_correct_answer(self, item: Dict[str, Any]) -> str:
+#         """
+#         Get the correct answer text for a question (MedMCQA-specific).
+#         
+#         :param item: Single data item from the dataset
+#         :type item: Dict[str, Any]
+#         :returns: Correct answer text
+#         :rtype: str
+#         """
+#         cop = item['cop']
+#         option_map = {1: 'opa', 2: 'opb', 3: 'opc', 4: 'opd'}
+#         return item[option_map[cop]]
+#     
+#     def _create_response(self, item: Dict[str, Any], include_explanation: bool = True) -> str:
+#         """
+#         Create a response for the question (MedMCQA-specific).
+#         
+#         For standard distillation methods (SFT, Logit-KD), the teacher will generate
+#         responses online during training. This method creates a simple placeholder
+#         that includes the explanation if available.
+#         
+#         :param item: Single data item from the dataset
+#         :type item: Dict[str, Any]
+#         :param include_explanation: Whether to include the explanation
+#         :type include_explanation: bool
+#         :returns: Formatted response string
+#         :rtype: str
+#         """
+#         correct_answer = self._get_correct_answer(item)
+#         response = f"The correct answer is: {correct_answer}"
+#         
+#         if include_explanation and item.get('exp') and item['exp'] != 'null':
+#             response += f"\n\nExplanation: {item['exp']}"
+#         
+#         return response
+#     
+#     def __len__(self) -> int:
+#         """
+#         Return the number of examples in the dataset.
+#         
+#         :returns: Total number of examples
+#         :rtype: int
+#         """
+#         return len(self.data)
+#     
+#     def __getitem__(self, idx: int) -> Dict[str, Any]:
+#         """
+#         Get a single example from the dataset.
+#         
+#         Note: For all distillation methods, teacher responses are generated
+#         online during training. This method returns basic question/response
+#         format with ground truth for reference.
+#         
+#         :param idx: Index of the example
+#         :type idx: int
+#         :returns: Dictionary containing the example data
+#         :rtype: Dict[str, Any]
+#         """
+#         item = self.data[idx]
+#         
+#         # Format the question
+#         question = self._format_question(item)
+#         
+#         # For all methods, create standard response
+#         # Teacher will generate actual responses online during training
+#         response = self._create_response(item)
+#         
+#         return {
+#             'question': question,
+#             'response': response,
+#             'correct_answer': self._get_correct_answer(item),
+#             'explanation': item.get('exp', ''),
+#             'subject': item.get('subject_name', ''),
+#             'topic': item.get('topic_name', ''),
+#             'id': item.get('id', '')
+#         }
 
 
 # ==============================================================================
-# COLLATOR CLASS - Batching and Tokenization
+# COLLATOR CLASS - Batching and Tokenization (DEPRECATED - Use UniversalMedicalCollator)
 # ==============================================================================
+# NOTE: MedMcqaCollator is DEPRECATED. It only works with MedMCQA-specific format 
+# (requires 'opa', 'opb', etc. fields). For multi-format support with unified 
+# Med-DistillMix data, use UniversalMedicalCollator instead (defined below).
+# This class is kept commented for backward compatibility reference only.
 
-class MedMcqaCollator:
-    """
-    Collator class for batching MedMCQA data.
-    
-    Handles tokenization and batching for different distillation methods.
-    Converts raw text data into tensors suitable for model training.
-    
-    :param tokenizer: HuggingFace tokenizer
-    :type tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast]
-    :param max_length: Maximum sequence length
-    :type max_length: int
-    :param distillation_method: Type of distillation method
-    :type distillation_method: str
-    :param cot_prompt: Chain-of-thought prompt for CoT
-    :type cot_prompt: str
-    """
-    
-    def __init__(
-        self,
-        tokenizer: Union['PreTrainedTokenizer', 'PreTrainedTokenizerFast'],
-        max_length: int = 512,
-        distillation_method: str = 'sft',
-        cot_prompt: str = "Let's think step by step:",
-        **kwargs  # noqa: F841
-    ):
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.distillation_method = distillation_method.lower()
-        self.cot_prompt = cot_prompt
-    
-    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Collate a batch of examples.
-        
-        Note: All methods now use standard collation. Teacher responses are
-        generated online during training by the distillation methods themselves.
-        
-        :param batch: List of examples from the dataset
-        :type batch: List[Dict[str, Any]]
-        :returns: Batched and tokenized data
-        :rtype: Dict[str, Any]
-        """
-        # Use standard collation for all methods
-        # CoT and SPIN handle their specific requirements in their own compute_loss methods
-        return self._collate_standard_batch(batch)
-    
-    def _collate_standard_batch(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Collate batch for all distillation methods."""
-        questions = [item['question'] for item in batch]
-        responses = [item['response'] for item in batch]
-        
-        # Create prompts (questions + responses)
-        prompts = [f"{q}\n\nAnswer: {r}" for q, r in zip(questions, responses)]
-        
-        # Tokenize prompts
-        tokenized = self.tokenizer(
-            prompts,
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt"
-        )
-        
-        return {
-            'prompts': prompts,
-            'input_ids': tokenized['input_ids'],
-            'attention_mask': tokenized['attention_mask'],
-            'questions': questions,
-            'responses': responses,
-            'correct_answers': [item['correct_answer'] for item in batch],
-            'explanations': [item['explanation'] for item in batch],
-            'subjects': [item['subject'] for item in batch],
-            'topics': [item['topic'] for item in batch],
-            'ids': [item['id'] for item in batch]
-        }
+# class MedMcqaCollator:
+#     """
+#     Collator class for batching MedMCQA data (MedMCQA-specific).
+#     
+#     Handles tokenization and batching for different distillation methods.
+#     Converts raw text data into tensors suitable for model training.
+#     
+#     :param tokenizer: HuggingFace tokenizer
+#     :type tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast]
+#     :param max_length: Maximum sequence length
+#     :type max_length: int
+#     :param distillation_method: Type of distillation method
+#     :type distillation_method: str
+#     :param cot_prompt: Chain-of-thought prompt for CoT
+#     :type cot_prompt: str
+#     """
+#     
+#     def __init__(
+#         self,
+#         tokenizer: Union['PreTrainedTokenizer', 'PreTrainedTokenizerFast'],
+#         max_length: int = 512,
+#         distillation_method: str = 'sft',
+#         cot_prompt: str = "Let's think step by step:",
+#         **kwargs  # noqa: F841
+#     ):
+#         self.tokenizer = tokenizer
+#         self.max_length = max_length
+#         self.distillation_method = distillation_method.lower()
+#         self.cot_prompt = cot_prompt
+#     
+#     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+#         """
+#         Collate a batch of examples (MedMCQA-specific).
+#         
+#         Note: All methods now use standard collation. Teacher responses are
+#         generated online during training by the distillation methods themselves.
+#         
+#         :param batch: List of examples from the dataset
+#         :type batch: List[Dict[str, Any]]
+#         :returns: Batched and tokenized data
+#         :rtype: Dict[str, Any]
+#         """
+#         # Use standard collation for all methods
+#         # CoT and SPIN handle their specific requirements in their own compute_loss methods
+#         return self._collate_standard_batch(batch)
+#     
+#     def _collate_standard_batch(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+#         """Collate batch for all distillation methods (MedMCQA-specific)."""
+#         questions = [item['question'] for item in batch]
+#         responses = [item['response'] for item in batch]
+#         
+#         # Create prompts (questions + responses)
+#         prompts = [f"{q}\n\nAnswer: {r}" for q, r in zip(questions, responses)]
+#         
+#         # Tokenize prompts
+#         tokenized = self.tokenizer(
+#             prompts,
+#             padding=True,
+#             truncation=True,
+#             max_length=self.max_length,
+#             return_tensors="pt"
+#         )
+#         
+#         return {
+#             'prompts': prompts,
+#             'input_ids': tokenized['input_ids'],
+#             'attention_mask': tokenized['attention_mask'],
+#             'questions': questions,
+#             'responses': responses,
+#             'correct_answers': [item['correct_answer'] for item in batch],
+#             'explanations': [item['explanation'] for item in batch],
+#             'subjects': [item['subject'] for item in batch],
+#             'topics': [item['topic'] for item in batch],
+#             'ids': [item['id'] for item in batch]
+#         }
 
 
 # ==============================================================================
@@ -319,8 +334,8 @@ def create_dataloader(
     :returns: Configured DataLoader
     :rtype: DataLoader
     """
-    # Create dataset
-    dataset = MedMcqaDataset(
+    # Create dataset - Use UniversalMedicalDataset for multi-format support
+    dataset = UniversalMedicalDataset(
         data_path=data_path,
         tokenizer=tokenizer,
         max_length=max_length,
@@ -328,8 +343,8 @@ def create_dataloader(
         **kwargs
     )
     
-    # Create collator
-    collator = MedMcqaCollator(
+    # Create collator - Use UniversalMedicalCollator for standardized batching
+    collator = UniversalMedicalCollator(
         tokenizer=tokenizer,
         max_length=max_length,
         distillation_method=distillation_method,
@@ -684,6 +699,77 @@ class UniversalMedicalDataset(Dataset):
             'source': item['source'],
             'id': item['id'],
             'metadata': item['metadata']
+        }
+
+
+# ==============================================================================
+# UNIVERSAL MEDICAL COLLATOR - For Multi-Format Batching
+# ==============================================================================
+
+class UniversalMedicalCollator:
+    """
+    Collator class for UniversalMedicalDataset.
+    
+    Handles batching and tokenization for the unified multi-format medical dataset.
+    Works with standardized output from UniversalMedicalDataset.__getitem__().
+    
+    :param tokenizer: HuggingFace tokenizer
+    :type tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast]
+    :param max_length: Maximum sequence length
+    :type max_length: int
+    :param distillation_method: Type of distillation method
+    :type distillation_method: str
+    """
+    
+    def __init__(
+        self,
+        tokenizer: Union['PreTrainedTokenizer', 'PreTrainedTokenizerFast'],
+        max_length: int = 1024,
+        distillation_method: str = 'sft',
+        **kwargs  # noqa: F841
+    ):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.distillation_method = distillation_method.lower()
+    
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Collate a batch of examples from UniversalMedicalDataset.
+        
+        Takes standardized format with 'question', 'ground_truth_answer', 'source', etc.
+        and creates batched tensors for training.
+        
+        :param batch: List of examples from UniversalMedicalDataset.__getitem__()
+        :type batch: List[Dict[str, Any]]
+        :returns: Batched and tokenized data
+        :rtype: Dict[str, Any]
+        """
+        questions = [item['question'] for item in batch]
+        ground_truth_answers = [item['ground_truth_answer'] for item in batch]
+        
+        # Create prompts (question + answer for training)
+        prompts = [f"{q}\n\nAnswer: {a}" for q, a in zip(questions, ground_truth_answers)]
+        
+        # Tokenize prompts
+        tokenized = self.tokenizer(
+            prompts,
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt"
+        )
+        
+        return {
+            'prompts': prompts,
+            'input_ids': tokenized['input_ids'],
+            'attention_mask': tokenized['attention_mask'],
+            'questions': questions,
+            'responses': ground_truth_answers,  # Use ground truth as response
+            'correct_answers': ground_truth_answers,
+            'explanations': [item['metadata'].get('explanation', '') for item in batch],
+            'subjects': [item['metadata'].get('subject', item['source']) for item in batch],
+            'topics': [item['metadata'].get('topic', '') for item in batch],
+            'ids': [item['id'] for item in batch]
         }
 
 
