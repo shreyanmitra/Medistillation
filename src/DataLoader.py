@@ -763,7 +763,8 @@ def prepare_med_distillmix_dataset(
     # 2. Load MedQA
     logger.info(f"\n2. Loading MedQA...")
     try:
-        medqa = load_dataset('bigbio/med_qa', split='train')
+        # Use the correct dataset path without custom script
+        medqa = load_dataset('GBaker/MedQA-USMLE-4-options', split='train')
         logger.info(f"   Total available: {len(medqa)} examples")
         
         if num_medqa is not None:
@@ -797,7 +798,8 @@ def prepare_med_distillmix_dataset(
     # 4. Load PubHealth
     logger.info(f"\n4. Loading PubHealth...")
     try:
-        pubhealth = load_dataset('bigbio/pubhealth', 'pubhealth_bigbio_text', split='train')
+        # Use health_fact dataset as alternative (PubHealth derivative)
+        pubhealth = load_dataset('health_fact', split='train')
         logger.info(f"   Total available: {len(pubhealth)} examples")
         
         if num_pubhealth is not None:
@@ -904,7 +906,8 @@ def download_benchmark_test_sets(output_dir: str = 'data/benchmarks'):
     # 1. MedQA test set
     logger.info("\n1. Downloading MedQA test set...")
     try:
-        medqa_test = load_dataset('bigbio/med_qa', split='test')
+        # Use the correct MedQA dataset
+        medqa_test = load_dataset('GBaker/MedQA-USMLE-4-options', split='test')
         save_jsonl(medqa_test, os.path.join(output_dir, 'medqa_test.jsonl'))
         logger.info(f"   ✅ Saved {len(medqa_test)} examples to medqa_test.jsonl")
     except Exception as e:
@@ -922,7 +925,8 @@ def download_benchmark_test_sets(output_dir: str = 'data/benchmarks'):
     # 3. PubMedQA test set (labeled subset)
     logger.info("\n3. Downloading PubMedQA test set...")
     try:
-        pubmedqa_test = load_dataset('qiaojin/PubMedQA', 'pqa_labeled', split='test')
+        # The labeled split only has 'train', use it as test set
+        pubmedqa_test = load_dataset('qiaojin/PubMedQA', 'pqa_labeled', split='train')
         save_jsonl(pubmedqa_test, os.path.join(output_dir, 'pubmedqa_test.jsonl'))
         logger.info(f"   ✅ Saved {len(pubmedqa_test)} examples to pubmedqa_test.jsonl")
     except Exception as e:
@@ -931,7 +935,8 @@ def download_benchmark_test_sets(output_dir: str = 'data/benchmarks'):
     # 4. PubHealth test set
     logger.info("\n4. Downloading PubHealth test set...")
     try:
-        pubhealth_test = load_dataset('bigbio/pubhealth', 'pubhealth_bigbio_text', split='test')
+        # Use health_fact as alternative, use validation split as test
+        pubhealth_test = load_dataset('health_fact', split='validation')
         save_jsonl(pubhealth_test, os.path.join(output_dir, 'pubhealth_test.jsonl'))
         logger.info(f"   ✅ Saved {len(pubhealth_test)} examples to pubhealth_test.jsonl")
     except Exception as e:
@@ -1242,61 +1247,5 @@ Examples:
             create_fidelitybench_med(
                 output_path=args.fidelitybench_path,
                 num_samples=args.num_fidelity,
-                seed=args.seed
-            )
-    parser.add_argument('--benchmark_dir', type=str, default='data/benchmarks',
-                        help='Output directory for benchmarks (default: data/benchmarks)')
-    parser.add_argument('--perplexity_path', type=str, default='data/medppl_10k.jsonl',
-                        help='Output path for perplexity corpus (default: data/medppl_10k.jsonl)')
-    
-    parser.add_argument('--num_medmcqa', type=int, default=50000,
-                        help='Number of MedMCQA samples (default: 50000)')
-    parser.add_argument('--num_medqa', type=int, default=10000,
-                        help='Number of MedQA samples (default: 10000)')
-    parser.add_argument('--num_pubmedqa', type=int, default=20000,
-                        help='Number of PubMedQA samples (default: 20000)')
-    parser.add_argument('--num_perplexity', type=int, default=10000,
-                        help='Number of abstracts for perplexity corpus (default: 10000)')
-    
-    parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed for reproducibility (default: 42)')
-    
-    args = parser.parse_args()
-    
-    # Check if any action specified
-    any_action = args.prepare_all or args.prepare_training or args.download_benchmarks or args.create_perplexity_corpus
-    
-    if not any_action:
-        print("=" * 80)
-        print("MEDICAL DATASET PREPARATION UTILITIES")
-        print("=" * 80)
-        print("\nNo action specified. Use --help for options.")
-        print("\nQuick start:")
-        print("  python DataLoader.py --prepare_all")
-        print("\nAvailable actions:")
-        print("  --prepare_all              Prepare everything (recommended)")
-        print("  --prepare_training         Create Med-DistillMix training dataset (~80k examples)")
-        print("  --download_benchmarks      Download evaluation benchmarks (MedQA, MedMCQA, PubMedQA)")
-        print("  --create_perplexity_corpus Create MedPPL-10k perplexity corpus")
-        print("\nFor detailed usage, run: python DataLoader.py --help")
-        print("=" * 80)
-    else:
-        # Execute requested actions
-        if args.prepare_all or args.prepare_training:
-            prepare_med_distillmix_dataset(
-                output_dir=args.output_dir,
-                seed=args.seed,
-                num_medmcqa=args.num_medmcqa,
-                num_medqa=args.num_medqa,
-                num_pubmedqa=args.num_pubmedqa
-            )
-        
-        if args.prepare_all or args.download_benchmarks:
-            download_benchmark_test_sets(output_dir=args.benchmark_dir)
-        
-        if args.prepare_all or args.create_perplexity_corpus:
-            create_medppl_10k_corpus(
-                output_path=args.perplexity_path,
-                num_samples=args.num_perplexity,
                 seed=args.seed
             )
