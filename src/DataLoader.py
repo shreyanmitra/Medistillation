@@ -799,7 +799,7 @@ def prepare_med_distillmix_dataset(
     logger.info(f"\n4. Loading PubHealth...")
     try:
         # Use health_fact dataset as alternative (PubHealth derivative)
-        pubhealth = load_dataset('health_fact', split='train')
+        pubhealth = load_dataset('health_fact', split='train', trust_remote_code=True)
         logger.info(f"   Total available: {len(pubhealth)} examples")
         
         if num_pubhealth is not None:
@@ -936,7 +936,7 @@ def download_benchmark_test_sets(output_dir: str = 'data/benchmarks'):
     logger.info("\n4. Downloading PubHealth test set...")
     try:
         # Use health_fact as alternative, use validation split as test
-        pubhealth_test = load_dataset('health_fact', split='validation')
+        pubhealth_test = load_dataset('health_fact', split='validation', trust_remote_code=True)
         save_jsonl(pubhealth_test, os.path.join(output_dir, 'pubhealth_test.jsonl'))
         logger.info(f"   ✅ Saved {len(pubhealth_test)} examples to pubhealth_test.jsonl")
     except Exception as e:
