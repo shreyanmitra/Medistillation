@@ -325,6 +325,12 @@ def load_tokenizer(model_name: str) -> AutoTokenizer:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token  # Use end-of-sequence token for padding
         tokenizer.pad_token_id = tokenizer.eos_token_id
+    
+    # Set left-padding for decoder-only models (required for correct generation)
+    # Decoder-only models like Llama/Meditron generate left-to-right, so padding
+    # must be on the left to avoid attending to padding tokens during generation
+    tokenizer.padding_side = 'left'
+    logger.info("Tokenizer configured with left-padding for decoder-only architecture")
 
     logger.info("Tokenizer loaded successfully")
     return tokenizer

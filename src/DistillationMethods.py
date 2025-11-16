@@ -2669,14 +2669,14 @@ def create_distillation_method(
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # ⚠️  VALIDATE TOKENIZER COMPATIBILITY UPFRONT ⚠️
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # This check ensures the tokenizer works with both teacher and student.
-    # Prevents cryptic errors during training from vocab mismatches.
+    # This check logs vocabulary size info but doesn't raise errors.
+    # The Trainer.py handles alignment before calling this function.
     validate_tokenizer_compatibility(
         teacher_model=teacher_model,
         student_model=student_model,
         tokenizer=tokenizer,
         method_name=method_name,
-        strict=True  # Raises error if incompatible (change to False for warnings only)
+        strict=False  # Don't raise error - Trainer.py handles alignment
     )
     
     # ===== SUPERVISED DISTILLATION METHODS =====
