@@ -36,6 +36,33 @@ class BaseDistillationMethod(ABC):
     """
     Abstract base class for all knowledge distillation methods.
     
+    ⚠️  CRITICAL TOKENIZER REQUIREMENT ⚠️
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    The tokenizer parameter MUST be compatible with BOTH teacher and student models!
+    
+    This implementation uses a SINGLE SHARED TOKENIZER for both models. This means:
+    - Token ID 12345 must mean the same thing to both teacher and student
+    - Vocabulary sizes should match (or be very similar)
+    - Special tokens (pad, EOS, BOS) must align
+    
+    ✅ VALID COMBINATIONS (same tokenizer family):
+        • Teacher: epfl-llm/meditron-70b + Student: epfl-llm/meditron-7b (both Llama)
+        • Teacher: Qwen/Qwen2-72B + Student: Qwen/Qwen2-1.5B (both Qwen)
+        • Teacher: meta-llama/Llama-3.1-70B + Student: TinyLlama/TinyLlama-1.1B (both Llama)
+    
+    ❌ INVALID COMBINATIONS (different tokenizers):
+        • Teacher: epfl-llm/meditron-70b (Llama, 50K vocab) + Student: Qwen/Qwen2-1.5B (Qwen, 152K vocab)
+        • Teacher: any-llama-model + Student: microsoft/phi-2 (different tokenizers)
+        • Teacher: any-model + Student: different-family-model (always risky!)
+    
+    WHY THIS MATTERS:
+    - Teacher receives student's token IDs as input → must understand them
+    - LogitKD/AdaKD compare probability distributions → vocab sizes must match
+    - Feature/attention matching uses same token positions → must align
+    
+    Use validate_tokenizer_compatibility() to check before training!
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    
     Every distillation method MUST implement:
     1. compute_loss() - Calculate how wrong the student is
     2. get_method_name() - Return a name for logging/results
@@ -44,7 +71,7 @@ class BaseDistillationMethod(ABC):
     :type teacher_model: nn.Module
     :param student_model: The small model to train
     :type student_model: nn.Module
-    :param tokenizer: Tokenizer used by both ``teacher_model`` and ``student_model``
+    :param tokenizer: Tokenizer used by both ``teacher_model`` and ``student_model`` (MUST be compatible with both!)
     :type tokenizer: TokenizerType
     :param config: Hyperparameters (learning rate, etc.)
     :type config: Dict[str, Any]
@@ -2203,6 +2230,123 @@ class SPINDistillation(BaseRLDistillationMethod):
 
 
 # ==============================================================================
+# TOKENIZER COMPATIBILITY VALIDATION
+# ==============================================================================
+
+def validate_tokenizer_compatibility(
+    teacher_model: nn.Module,
+    student_model: nn.Module,
+    tokenizer: TokenizerType,
+    method_name: str,
+    strict: bool = True
+) -> None:
+    """
+    Validate that the provided tokenizer is compatible with both teacher and student models.
+    
+    This is CRITICAL because the implementation uses a single shared tokenizer for both models.
+    Incompatible tokenizers will cause:
+    - Teacher to receive token IDs it doesn't understand (gibberish input)
+    - Dimension mismatches in logit-based methods (vocab size mismatch)
+    - Incorrect feature/attention alignment
+    
+    :param teacher_model: The teacher model
+    :type teacher_model: nn.Module
+    :param student_model: The student model
+    :type student_model: nn.Module
+    :param tokenizer: The tokenizer to validate
+    :type tokenizer: TokenizerType
+    :param method_name: Name of distillation method (for error messages)
+    :type method_name: str
+    :param strict: If True, raises error on mismatch. If False, only warns.
+    :type strict: bool
+    :raises ValueError: If tokenizer is incompatible and strict=True
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    # Get vocabulary sizes from models
+    teacher_vocab_size = teacher_model.config.vocab_size
+    student_vocab_size = student_model.config.vocab_size
+    tokenizer_vocab_size = len(tokenizer)
+    
+    # Check if vocab sizes match
+    issues = []
+    
+    if teacher_vocab_size != tokenizer_vocab_size:
+        issues.append(
+            f"Teacher vocab size ({teacher_vocab_size:,}) != Tokenizer vocab size ({tokenizer_vocab_size:,})"
+        )
+    
+    if student_vocab_size != tokenizer_vocab_size:
+        issues.append(
+            f"Student vocab size ({student_vocab_size:,}) != Tokenizer vocab size ({tokenizer_vocab_size:,})"
+        )
+    
+    if teacher_vocab_size != student_vocab_size:
+        issues.append(
+            f"Teacher vocab size ({teacher_vocab_size:,}) != Student vocab size ({student_vocab_size:,})"
+        )
+    
+    # Check special tokens
+    if hasattr(tokenizer, 'pad_token_id') and tokenizer.pad_token_id is not None:
+        if tokenizer.pad_token_id >= teacher_vocab_size:
+            issues.append(
+                f"Tokenizer pad_token_id ({tokenizer.pad_token_id}) >= Teacher vocab size ({teacher_vocab_size})"
+            )
+        if tokenizer.pad_token_id >= student_vocab_size:
+            issues.append(
+                f"Tokenizer pad_token_id ({tokenizer.pad_token_id}) >= Student vocab size ({student_vocab_size})"
+            )
+    
+    if hasattr(tokenizer, 'eos_token_id') and tokenizer.eos_token_id is not None:
+        if tokenizer.eos_token_id >= teacher_vocab_size:
+            issues.append(
+                f"Tokenizer eos_token_id ({tokenizer.eos_token_id}) >= Teacher vocab size ({teacher_vocab_size})"
+            )
+        if tokenizer.eos_token_id >= student_vocab_size:
+            issues.append(
+                f"Tokenizer eos_token_id ({tokenizer.eos_token_id}) >= Student vocab size ({student_vocab_size})"
+            )
+    
+    # If issues found, report them
+    if issues:
+        error_msg = f"\n{'='*80}\n"
+        error_msg += "⚠️  TOKENIZER COMPATIBILITY ERROR ⚠️\n"
+        error_msg += f"{'='*80}\n"
+        error_msg += f"Method: {method_name}\n\n"
+        error_msg += "Issues detected:\n"
+        for i, issue in enumerate(issues, 1):
+            error_msg += f"  {i}. {issue}\n"
+        error_msg += "\n"
+        error_msg += "This will cause training to FAIL because:\n"
+        error_msg += "  • Teacher receives token IDs it doesn't understand\n"
+        error_msg += "  • Logit-based methods get dimension mismatches\n"
+        error_msg += "  • Feature/attention matching fails\n"
+        error_msg += "\n"
+        error_msg += "SOLUTIONS:\n"
+        error_msg += "  1. Use models from the same family (recommended):\n"
+        error_msg += "     Teacher: epfl-llm/meditron-70b + Student: epfl-llm/meditron-7b\n"
+        error_msg += "     Teacher: Qwen/Qwen2-72B + Student: Qwen/Qwen2-1.5B\n"
+        error_msg += "     Teacher: meta-llama/Llama-3.1-70B + Student: TinyLlama/TinyLlama-1.1B\n"
+        error_msg += "\n"
+        error_msg += "  2. Load tokenizer from teacher model instead:\n"
+        error_msg += "     tokenizer = AutoTokenizer.from_pretrained(teacher_model_name)\n"
+        error_msg += "\n"
+        error_msg += "  3. Implement Universal Logit Distillation (ULD) for vocab alignment\n"
+        error_msg += f"{'='*80}\n"
+        
+        if strict:
+            raise ValueError(error_msg)
+        else:
+            logger.warning(error_msg)
+    else:
+        logger.info(f"✅ Tokenizer compatibility validated for method '{method_name}'")
+        logger.info(f"   Teacher vocab: {teacher_vocab_size:,}")
+        logger.info(f"   Student vocab: {student_vocab_size:,}")
+        logger.info(f"   Tokenizer vocab: {tokenizer_vocab_size:,}")
+
+
+# ==============================================================================
 # FACTORY FUNCTIONS
 # ==============================================================================
 
@@ -2434,6 +2578,19 @@ def create_distillation_method(
         loss, metrics = method.compute_loss(batch)
     """
     method_name = method_name.lower()
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ⚠️  VALIDATE TOKENIZER COMPATIBILITY UPFRONT ⚠️
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # This check ensures the tokenizer works with both teacher and student.
+    # Prevents cryptic errors during training from vocab mismatches.
+    validate_tokenizer_compatibility(
+        teacher_model=teacher_model,
+        student_model=student_model,
+        tokenizer=tokenizer,
+        method_name=method_name,
+        strict=True  # Raises error if incompatible (change to False for warnings only)
+    )
     
     # ===== SUPERVISED DISTILLATION METHODS =====
     
