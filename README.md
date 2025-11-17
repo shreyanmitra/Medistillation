@@ -2,7 +2,7 @@
 
 > **Comparative Analysis of Knowledge Distillation Methods for Medical Question Answering**
 
-A comprehensive framework for distilling large medical language models (70B parameters) into efficient smaller models (1.5B parameters) using multiple state-of-the-art distillation techniques.
+A comprehensive complete framework for distilling large medical language models (70B parameters) into efficient smaller models (1.5B parameters) using multiple state-of-the-art distillation techniques.
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org/)
