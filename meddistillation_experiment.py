@@ -243,14 +243,55 @@ for method_idx, method in enumerate(METHODS_TO_RUN, 1):
     print("-" * 80)
 
     import subprocess
-    # Run training
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=False)
-
+    import sys
+    
+    # Run training with real-time output streaming to show progress bars
+    print("\n📊 Training Progress (real-time):")
+    print("   You will see batch-by-batch progress below (from Trainer.py)")
+    print("-" * 80)
+    
+    # Use Popen to stream output in real-time so tqdm progress bars are visible
+    # Note: tqdm works best when output is a TTY, so we'll stream directly
+    process = subprocess.Popen(
+        cmd,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,  # Merge stderr into stdout
+        text=True,
+        bufsize=1,  # Line buffered for real-time output
+        universal_newlines=True
+    )
+    
+    # Stream output in real-time to show progress bars
+    output_lines = []
+    try:
+        # Read line by line and print immediately
+        while True:
+            output = process.stdout.readline()
+            if output == '' and process.poll() is not None:
+                break
+            if output:
+                print(output, end='', flush=True)  # Print immediately
+                output_lines.append(output)
+    except KeyboardInterrupt:
+        process.terminate()
+        print("\n⚠️  Training interrupted by user")
+        raise
+    
+    # Wait for process to complete and get return code
+    return_code = process.poll()
+    
+    # Store full output for error reporting
+    full_output = ''.join(output_lines)
+    
     # Check if training failed
-    if result.returncode != 0:
-        print(f"\n❌ ERROR: Training failed with return code {result.returncode}")
-        print(f"STDERR:\n{result.stderr}")
-        print(f"STDOUT:\n{result.stdout}")
+    if return_code != 0:
+        print(f"\n❌ ERROR: Training failed with return code {return_code}")
+        if full_output:
+            # Show last 50 lines of output for debugging
+            error_lines = full_output.split('\n')[-50:]
+            print("\nLast 50 lines of output:")
+            print('\n'.join(error_lines))
         print("Continuing with next method...\n")
 
     # Calculate elapsed time
