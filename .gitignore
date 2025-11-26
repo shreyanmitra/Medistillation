@@ -61,7 +61,6 @@ desktop.ini
 
 # Jupyter Notebooks
 .ipynb_checkpoints/
-*.ipynb
 
 # Test coverage
 .coverage
