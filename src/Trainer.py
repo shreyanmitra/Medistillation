@@ -2632,8 +2632,8 @@ def main():
                         help='Evaluate every N steps (0 to disable)')
     parser.add_argument('--logging_steps', type=int, default=10,
                         help='Log every N steps')
-    parser.add_argument('--num_workers', type=int, default=4,
-                        help='Number of data loading workers')
+    parser.add_argument('--num_workers', type=int, default=8,
+                        help='Number of data loading workers (increase for better GPU utilization)')
 
     # Ablation study arguments
     parser.add_argument('--run_ablation', action='store_true',

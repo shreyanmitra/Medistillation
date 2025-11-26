@@ -6,8 +6,8 @@ STUDENT_MODEL = "meta-llama/Llama-2-7b-hf"
 BASELINE_MODEL = "epfl-llm/meditron-7b"
 
 NUM_EPOCHS = 3
-BATCH_SIZE = 2              
-GRADIENT_ACCUMULATION = 16
+BATCH_SIZE = 512              
+GRADIENT_ACCUMULATION = 1
 LEARNING_RATE = 1e-4 
 
 ENABLE_CPU_OFFLOAD = True
@@ -33,6 +33,7 @@ print(f"  • Batch Size: {BATCH_SIZE}")
 print(f"  • Gradient Accumulation: {GRADIENT_ACCUMULATION}")
 print(f"  • Effective Batch Size: {BATCH_SIZE * GRADIENT_ACCUMULATION}")
 print(f"  • Learning Rate: {LEARNING_RATE}")
+print(f"  • GPU: RTX 5090 (32GB VRAM)")
 print(f"\n🔬 Methods: {', '.join(METHODS_TO_RUN)}")
 print(f"\n🎯 Research Goal:")
 print(f"  Demonstrate distillation matches direct fine-tuning at fraction of cost")
@@ -41,10 +42,6 @@ print("="*80)
 
 from huggingface_hub import login
 import os
-import torch
-
-# Set device to CUDA
-device = torch.device("cuda")
 
 print("="*80)
 print("🔐 HUGGINGFACE AUTHENTICATION")
@@ -169,6 +166,8 @@ for method_idx, method in enumerate(METHODS_TO_RUN, 1):
     output_dir = f"{OUTPUT_BASE}/{method}"
 
     # Build base command
+    # Note: With batch_size=512, ensure sufficient GPU memory (RTX 5090 32GB should handle this)
+    # Consider reducing max_length if you encounter OOM errors
     cmd = f"""python src/Trainer.py \\
         --teacher_model {TEACHER_MODEL} \\
         --student_model {STUDENT_MODEL} \\
@@ -179,6 +178,8 @@ for method_idx, method in enumerate(METHODS_TO_RUN, 1):
         --batch_size {BATCH_SIZE} \\
         --gradient_accumulation_steps {GRADIENT_ACCUMULATION} \\
         --learning_rate {LEARNING_RATE} \\
+        --max_length 1024 \\
+        --num_workers 16 \\
         --output_dir {output_dir}"""
 
     if ENABLE_CPU_OFFLOAD:

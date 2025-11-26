@@ -351,14 +351,17 @@ def create_dataloader(
         **kwargs
     )
     
-    # Create DataLoader
+    # Create DataLoader with optimizations for GPU utilization
     dataloader = DataLoader(
         dataset=dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
         collate_fn=collator,
-        pin_memory=True if torch.cuda.is_available() else False
+        pin_memory=True if torch.cuda.is_available() else False,
+        persistent_workers=True if num_workers > 0 else False,  # Keep workers alive between epochs
+        prefetch_factor=2 if num_workers > 0 else None,  # Prefetch 2 batches per worker
+        drop_last=False  # Don't drop incomplete batches
     )
     
     logger.info("Created DataLoader with %d examples, batch_size=%d", len(dataset), batch_size)
