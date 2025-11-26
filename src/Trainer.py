@@ -154,8 +154,8 @@ class TrainingConfig:
         self.logging_steps: int = args.logging_steps
         self.num_workers: int = args.num_workers
 
-        # Device
-        self.device: str = "cuda" if torch.cuda.is_available() else "cpu"
+        # Device - always use CUDA for training
+        self.device: str = "cuda"
 
         # Create output directories
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
@@ -237,6 +237,14 @@ def load_teacher_model(
         )
 
     model.eval()  # Teacher is always in evaluation mode (no training, only inference)
+    
+    # Move model to CUDA device (required for training)
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for training but is not available")
+    device = torch.device("cuda")
+    model = model.to(device)
+    logger.info(f"Teacher model moved to {device}")
+    
     logger.info("Teacher model loaded successfully")
     return model
 
@@ -303,6 +311,13 @@ def load_student_model(
         model = get_peft_model(model, peft_config)  # Wrap model with LoRA adapters
         model.print_trainable_parameters()  # Log how many parameters are trainable
 
+    # Move model to CUDA device (required for training)
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for training but is not available")
+    device = torch.device("cuda")
+    model = model.to(device)
+    logger.info(f"Student model moved to {device}")
+    
     logger.info("Student model loaded successfully")
     return model
 

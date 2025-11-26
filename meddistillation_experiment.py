@@ -41,6 +41,10 @@ print("="*80)
 
 from huggingface_hub import login
 import os
+import torch
+
+# Set device to CUDA
+device = torch.device("cuda")
 
 print("="*80)
 print("🔐 HUGGINGFACE AUTHENTICATION")
