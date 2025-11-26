@@ -251,14 +251,17 @@ class StandardSFT(BaseDistillationMethod):
         attention_mask = batch['attention_mask']
         
         # Generate teacher responses on-the-fly (online distillation)
-        with torch.no_grad():
+        # Use inference_mode instead of no_grad for better performance
+        with torch.inference_mode():
             full_sequence = self.teacher_model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=self.max_new_tokens,
                 do_sample=False,  # Greedy decoding for consistency
                 pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id
+                eos_token_id=self.tokenizer.eos_token_id,
+                use_cache=True,  # Enable KV cache for faster generation
+                num_beams=1  # Greedy decoding (no beam search overhead)
             )
             
             # Calculate where prompt ends and response begins
@@ -291,9 +294,11 @@ class StandardSFT(BaseDistillationMethod):
         
         loss = student_outputs.loss #Get cross-entropy loss, which in the case of SFT is the same as total loss
         
+        # Store metrics - convert to float immediately but use detach() first
+        # This avoids blocking but still provides float values for logging
         metrics = {
-            'ce_loss': loss.item(),
-            'total_loss': loss.item(),
+            'ce_loss': loss.detach().item(),
+            'total_loss': loss.detach().item(),
             'avg_response_length': float(response_length)
         }
         
@@ -391,14 +396,18 @@ class LogitKD(BaseDistillationMethod):
         attention_mask = batch['attention_mask']
         
         # Generate teacher responses on-the-fly (online distillation)
-        with torch.no_grad():
+        # Use inference_mode instead of no_grad for better performance
+        with torch.inference_mode():
+            # Use optimized generation settings for faster inference
             full_sequence = self.teacher_model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=self.max_new_tokens,
                 do_sample=False,  # Greedy decoding for consistency
                 pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id
+                eos_token_id=self.tokenizer.eos_token_id,
+                use_cache=True,  # Enable KV cache for faster generation
+                num_beams=1  # Greedy decoding (no beam search overhead)
             )
             
             # Calculate where prompt ends and response begins
@@ -425,7 +434,8 @@ class LogitKD(BaseDistillationMethod):
             # Teacher forward pass on full sequence to get logits (this is the first difference from SFT's compute_loss)
             teacher_outputs = self.teacher_model(
                 input_ids=full_sequence,
-                attention_mask=full_attention_mask
+                attention_mask=full_attention_mask,
+                use_cache=True  # Enable KV cache
             )
             teacher_logits = teacher_outputs.logits
         

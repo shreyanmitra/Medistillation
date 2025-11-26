@@ -507,12 +507,20 @@ class Trainer:
             loss.backward()  # Compute gradients (accumulate across multiple steps)
 
             # Store metrics for logging (scale loss back to original magnitude)
+            # Use detach() before item() to avoid blocking GPU
             epoch_losses.append(
-                loss.item() * self.config.gradient_accumulation_steps)
+                loss.detach().item() * self.config.gradient_accumulation_steps)
             for key, value in metrics.items():
                 if key not in epoch_metrics:
                     epoch_metrics[key] = []
-                epoch_metrics[key].append(value)
+                # Convert tensor metrics to float if needed (after backward pass)
+                if isinstance(value, torch.Tensor):
+                    if value.numel() == 1:
+                        epoch_metrics[key].append(value.detach().item())
+                    else:
+                        epoch_metrics[key].append(value.detach().mean().item())
+                else:
+                    epoch_metrics[key].append(value)
 
             # ===== Optimizer Step (only after accumulating enough gradients) =====
             if (step + 1) % self.config.gradient_accumulation_steps == 0:
