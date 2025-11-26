@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 TEACHER_MODEL = "epfl-llm/meditron-70b"
@@ -180,7 +181,7 @@ for method_idx, method in enumerate(METHODS_TO_RUN, 1):
         cmd += " \\\n        --enable_cpu_offload"
 
     if ALIGN_VOCABULARIES:
-      cmd += " \\\n        --align_vocabularies"
+        cmd += " \\\n        --align_vocabularies"
 
     # Add method-specific parameters
     method_params = method_info['params']
@@ -238,7 +239,14 @@ for method_idx, method in enumerate(METHODS_TO_RUN, 1):
 
     import subprocess
     # Run training
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=False)
+
+    # Check if training failed
+    if result.returncode != 0:
+        print(f"\n❌ ERROR: Training failed with return code {result.returncode}")
+        print(f"STDERR:\n{result.stderr}")
+        print(f"STDOUT:\n{result.stdout}")
+        print("Continuing with next method...\n")
 
     # Calculate elapsed time
     elapsed_time = time.time() - method_start_time
@@ -308,7 +316,6 @@ import json
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import plotly.express as px
 
 print("=" * 80)
 print("📊 VISUALIZATION AND COMPARISON")
@@ -324,7 +331,7 @@ for method in METHODS_TO_RUN:
 
     # Load numerical metrics and training history
     if os.path.exists(f"{results_dir}/comprehensive_evaluation.json"):
-        with open(f"{results_dir}/comprehensive_evaluation.json", 'r') as f:
+        with open(f"{results_dir}/comprehensive_evaluation.json", 'r', encoding='utf-8') as f:
             metrics = json.load(f)
             all_results[method] = metrics
 
@@ -347,7 +354,7 @@ for method in METHODS_TO_RUN:
 
     # Load training history for interactive plots
     if os.path.exists(f"{results_dir}/training_history.json"):
-        with open(f"{results_dir}/training_history.json", 'r') as f:
+        with open(f"{results_dir}/training_history.json", 'r', encoding='utf-8') as f:
             training_history[method] = json.load(f)
 
 # Create comparison table
@@ -408,7 +415,7 @@ for method in METHODS_TO_RUN:
     if os.path.exists(comparison_path):
         baseline_results_found = True
 
-        with open(comparison_path, 'r') as f:
+        with open(comparison_path, 'r', encoding='utf-8') as f:
             results = json.load(f)
 
         print(f"\n{'='*80}")
@@ -952,6 +959,7 @@ print("=" * 80)
 
 
 # Create a quick reference markdown file
+import torch
 readme_content = f"""# MedDistillation Experiment Results
 
 **Experiment Date:** {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
@@ -990,9 +998,10 @@ readme_content += f"""
 4. Run ablation studies to optimize performance
 """
 
-readme_path = f"{drive_output_dir}/README.md"
+# Use OUTPUT_BASE instead of drive_output_dir (which was notebook-specific)
+readme_path = f"{OUTPUT_BASE}/README.md"
 try:
-    with open(readme_path, 'w') as f:
+    with open(readme_path, 'w', encoding='utf-8') as f:
         f.write(readme_content)
     print(f"✅ README created: {readme_path}")
 except Exception as e:
@@ -1003,16 +1012,15 @@ print("\n" + "=" * 80)
 print("📊 EXPERIMENT SUMMARY")
 print("=" * 80)
 print(f"\n🕒 Total Experiment Duration: {sum(r['training_time_hours'] for r in training_results.values()):.2f} hours")
-print(f"📁 Results Location: {drive_output_dir}")
-print(f"🔗 Quick Access: Open in Google Drive")
+print(f"📁 Results Location: {OUTPUT_BASE}")
 print(f"\n✅ All outputs saved successfully!")
 print("=" * 80)
 
 # List saved files
 print("\n📋 Saved Files:")
-if os.path.exists(drive_output_dir):
-    for root, dirs, files in os.walk(drive_output_dir):
-        level = root.replace(drive_output_dir, '').count(os.sep)
+if os.path.exists(OUTPUT_BASE):
+    for root, dirs, files in os.walk(OUTPUT_BASE):
+        level = root.replace(OUTPUT_BASE, '').count(os.sep)
         indent = ' ' * 2 * level
         print(f"{indent}{os.path.basename(root)}/")
         subindent = ' ' * 2 * (level + 1)
