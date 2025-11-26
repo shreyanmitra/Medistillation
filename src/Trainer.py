@@ -238,14 +238,33 @@ def load_teacher_model(
 
     model.eval()  # Teacher is always in evaluation mode (no training, only inference)
     
-    # Move model to CUDA device (required for training)
+    # Check CUDA availability
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for training but is not available")
-    device = torch.device("cuda")
-    model = model.to(device)
-    logger.info(f"Teacher model moved to {device}")
     
-    logger.info("Teacher model loaded successfully")
+    # With device_map="auto", model is already distributed across devices (GPU + CPU)
+    # DO NOT call model.to(device) as it will try to move everything to GPU and cause OOM
+    logger.info("Step 4/4: Checking model device placement (device_map='auto' handles distribution)...")
+    
+    if hasattr(model, 'hf_device_map') and model.hf_device_map is not None:
+        # Count layers on each device
+        device_counts = {}
+        for device_name in model.hf_device_map.values():
+            device_counts[device_name] = device_counts.get(device_name, 0) + 1
+        
+        logger.info(f"📍 Teacher model device distribution: {device_counts}")
+        
+        if 'cpu' in device_counts:
+            logger.info(f"✅ {device_counts['cpu']} layers are on CPU (CPU offload active)")
+        if 'cuda:0' in device_counts or 'cuda' in device_counts:
+            gpu_layers = device_counts.get('cuda:0', 0) + device_counts.get('cuda', 0)
+            logger.info(f"✅ {gpu_layers} layers are on GPU")
+        
+        logger.info("✅ Teacher model device placement complete (using device_map='auto')")
+    else:
+        logger.warning("⚠️  device_map='auto' did not create device map - model may be on CPU")
+    
+    logger.info("✅ Teacher model loaded successfully")
     return model
 
 
@@ -311,14 +330,24 @@ def load_student_model(
         model = get_peft_model(model, peft_config)  # Wrap model with LoRA adapters
         model.print_trainable_parameters()  # Log how many parameters are trainable
 
-    # Move model to CUDA device (required for training)
+    # Check CUDA availability
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for training but is not available")
-    device = torch.device("cuda")
-    model = model.to(device)
-    logger.info(f"Student model moved to {device}")
     
-    logger.info("Student model loaded successfully")
+    # With device_map="auto", model is already distributed across devices (GPU + CPU)
+    # DO NOT call model.to(device) as it will try to move everything to GPU and cause OOM
+    logger.info("Checking student model device placement (device_map='auto' handles distribution)...")
+    
+    if hasattr(model, 'hf_device_map') and model.hf_device_map is not None:
+        device_counts = {}
+        for device_name in model.hf_device_map.values():
+            device_counts[device_name] = device_counts.get(device_name, 0) + 1
+        logger.info(f"📍 Student model device distribution: {device_counts}")
+        logger.info("✅ Student model device placement complete (using device_map='auto')")
+    else:
+        logger.warning("⚠️  device_map='auto' did not create device map - model may be on CPU")
+    
+    logger.info("✅ Student model loaded successfully")
     return model
 
 
