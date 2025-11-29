@@ -701,8 +701,111 @@ class Trainer:
             'config': self.config.to_dict()
         }
 
+        # If student is PEFT-wrapped, save adapters to a separate folder
+        try:
+            from peft import PeftModel
+            if isinstance(self.distillation_method.student_model, PeftModel):
+                adapter_dir = os.path.join(self.config.checkpoint_dir, f"peft_adapter_epoch_{epoch + 1}")
+                Path(adapter_dir).mkdir(parents=True, exist_ok=True)
+                # Save the PEFT adapters separately for reliable reload later
+                self.distillation_method.student_model.save_pretrained(adapter_dir)
+                checkpoint['peft_adapter_dir'] = adapter_dir
+        except Exception:
+            # PEFT not available or student not PEFT-wrapped — ignore
+            pass
+
         torch.save(checkpoint, checkpoint_path)
         logger.info(f"Saved checkpoint to {checkpoint_path}")
+    def load_checkpoint(self, checkpoint_path: str, load_optimizer: bool = True):
+        """
+        Load checkpoint and restore student model / optimizer / scheduler state.
+
+        This loader is defensive:
+        - loads checkpoint with map_location='cpu'
+        - checks a few critical config flags and warns on mismatch
+        - attempts to load PEFT adapters (if saved separately) via PeftModel
+        - falls back to non-strict state_dict loading and logs missing/unexpected keys
+        - avoids restoring optimizer state for quantized runs by default
+        """
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+        logger.info(f"Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+
+        # Quick config compatibility check (informative only)
+        saved_cfg = checkpoint.get('config', {})
+        incompatible = []
+        for k in ('use_quantization', 'enable_cpu_offload', 'student_model_name'):
+            if k in saved_cfg and getattr(self.config, k, None) != saved_cfg[k]:
+                incompatible.append((k, saved_cfg[k], getattr(self.config, k, None)))
+        if incompatible:
+            logger.warning(f"Checkpoint config differs from current config: {incompatible}")
+            logger.warning("Proceeding may fail. Ensure models/flags match the original run before loading.")
+
+        # If a PEFT adapter folder was saved, try loading adapters first (preferred)
+        try:
+            from peft import PeftModel
+            peft_dir = checkpoint.get('peft_adapter_dir', None)
+            if peft_dir and os.path.isdir(peft_dir):
+                logger.info(f"Found PEFT adapter in checkpoint: {peft_dir} — loading with PeftModel.from_pretrained")
+                base = self.distillation_method.student_model
+                self.distillation_method.student_model = PeftModel.from_pretrained(base, peft_dir, device_map="auto")
+            else:
+                # Attempt to load raw state dict into current model (non-strict)
+                state_dict = checkpoint.get('model_state_dict', {})
+                missing_keys, unexpected_keys = self.distillation_method.student_model.load_state_dict(state_dict, strict=False)
+                if missing_keys:
+                    logger.warning(f"Missing keys when loading state_dict: {missing_keys[:10]}{'...' if len(missing_keys)>10 else ''}")
+                if unexpected_keys:
+                    logger.warning(f"Unexpected keys in checkpoint: {unexpected_keys[:10]}{'...' if len(unexpected_keys)>10 else ''}")
+        except Exception as e:
+            logger.warning(f"PEFT/adapter loading path failed or not applicable: {e}")
+            # Fallback: try non-strict load
+            state_dict = checkpoint.get('model_state_dict', {})
+            try:
+                missing_keys, unexpected_keys = self.distillation_method.student_model.load_state_dict(state_dict, strict=False)
+                if missing_keys:
+                    logger.warning(f"Missing keys when loading state_dict (fallback): {missing_keys[:10]}{'...' if len(missing_keys)>10 else ''}")
+                if unexpected_keys:
+                    logger.warning(f"Unexpected keys in checkpoint (fallback): {unexpected_keys[:10]}{'...' if len(unexpected_keys)>10 else ''}")
+            except Exception as e2:
+                logger.error(f"Failed to load model state_dict: {e2}")
+                raise
+
+        # Optionally restore optimizer and scheduler
+        if load_optimizer and 'optimizer_state_dict' in checkpoint:
+            try:
+                if getattr(self.config, 'use_quantization', False):
+                    logger.warning("Quantized run detected: skipping optimizer restore to avoid bnb/optimizer incompatibilities")
+                else:
+                    self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except Exception as e:
+                logger.warning(f"Failed to load optimizer state dict: {e}. Skipping optimizer restore.")
+
+        if 'scheduler_state_dict' in checkpoint:
+            try:
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            except Exception:
+                logger.warning("Failed to load scheduler state dict")
+
+        # Restore bookkeeping
+        self.global_step = checkpoint.get('global_step', self.global_step)
+        self.best_val_loss = checkpoint.get('best_val_loss', self.best_val_loss)
+
+        # If CUDA available, move optimizer tensors to correct device (best-effort)
+        if torch.cuda.is_available():
+            try:
+                device = torch.device(self.config.device)
+                for state in self.optimizer.state.values():
+                    for k, v in list(state.items()):
+                        if isinstance(v, torch.Tensor):
+                            state[k] = v.to(device)
+            except Exception:
+                logger.warning("Failed to migrate optimizer tensors to CUDA — you may need to recreate the optimizer")
+        torch.cuda.empty_cache()
+
+        logger.info(f"Checkpoint loaded. global_step={self.global_step}, best_val_loss={self.best_val_loss}")
 
     def save_final_model(self):
         """Save final trained model."""
@@ -2628,6 +2731,8 @@ def main():
                         help='Use 8-bit quantization (QLoRA)')
     parser.add_argument('--enable_cpu_offload', action='store_true', default=False,
                         help='Enable CPU offloading for large teacher models (70B+)')
+    parser.add_argument('--resume_from_checkpoint', type=str, default='',
+                        help='Path to checkpoint file to resume training from (optional)')
     parser.add_argument('--align_vocabularies', action='store_true', default=False,
                         help='Automatically align student vocabulary to match teacher by adding extra tokens. '
                              'Required when teacher and student have different vocabulary sizes for logit-based methods. '
@@ -2992,6 +3097,12 @@ def main():
         scheduler=scheduler,
         tokenizer=tokenizer
     )
+
+    # Resume from checkpoint if requested
+    if getattr(args, 'resume_from_checkpoint', None):
+        resume_path = args.resume_from_checkpoint
+        logger.info(f"Resuming training from checkpoint: {resume_path}")
+        trainer.load_checkpoint(resume_path, load_optimizer=True)
 
     # ===== Start Training =====
     # Main training loop: iterate through epochs, update student model
