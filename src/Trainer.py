@@ -272,7 +272,8 @@ def load_student_model(
     model_name: str,
     use_lora: bool = True,
     lora_config: Optional[Dict[str, Any]] = None,
-    use_quantization: bool = True
+    use_quantization: bool = True, 
+    enable_cpu_offload: bool = False
 ) -> nn.Module:
     """
     Load student model with optional LoRA adapters.
@@ -285,15 +286,22 @@ def load_student_model(
     :type lora_config: Optional[Dict[str, Any]]
     :param use_quantization: Whether to use quantization (QLoRA)
     :type use_quantization: bool
+    :param enable_cpu_offload: Whether to enable FP32 CPU offload for k-bit weights
+                              (uses BitsAndBytesConfig.llm_int8_enable_fp32_cpu_offload)
+    :type enable_cpu_offload: bool
     :returns: Loaded student model
     :rtype: nn.Module
     """
     logger.info(f"Loading student model: {model_name}")
+    if enable_cpu_offload:
+        logger.info("CPU offloading ENABLED for student model (llm_int8_enable_fp32_cpu_offload=True)")
 
     if use_quantization:
         # QLoRA: Quantize base model to 8-bit, add trainable LoRA adapters in FP16
         # This dramatically reduces memory usage while maintaining training quality
-        quantization_config = setup_quantization_config()
+        # Pass enable_cpu_offload into the BitsAndBytesConfig so device_map="auto"
+        # can offload FP32 parts to CPU when necessary.
+        quantization_config = setup_quantization_config(enable_cpu_offload=enable_cpu_offload)
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             quantization_config=quantization_config,  # Quantize frozen weights to 8-bit
@@ -2386,7 +2394,8 @@ def run_ablation_study(
                 student_model_name,
                 use_lora=config_copy.use_lora,
                 lora_config=lora_config_dict,
-                use_quantization=config_copy.use_quantization
+                use_quantization=config_copy.use_quantization,
+                enable_cpu_offload = config_copy.enable_cpu_offload
             )
             
             # Create distillation method with updated config
@@ -2723,7 +2732,8 @@ def main():
         config.student_model_name,
         use_lora=config.use_lora,
         lora_config=lora_config_dict,
-        use_quantization=config.use_quantization
+        use_quantization=config.use_quantization,
+        enable_cpu_offload = config.enable_cpu_offload
     )
 
     # ===== Vocabulary Alignment for Logit-Based Methods =====
