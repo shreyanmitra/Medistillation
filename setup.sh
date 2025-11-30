@@ -1,4 +1,4 @@
-python -m venv
+python -m venv .
 source./bin/activate
 pip install -r requirements.txt
 pip install plotly kaleido ipywidgets huggingface-hub pandas plotly
