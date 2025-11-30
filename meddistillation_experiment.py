@@ -13,7 +13,7 @@ BATCH_SIZE = 1
 GRADIENT_ACCUMULATION = 1
 LEARNING_RATE = 1e-4 
 
-ENABLE_CPU_OFFLOAD = False  # Disable CPU offload for better GPU utilization (RTX 5090 has 32GB VRAM)
+ENABLE_CPU_OFFLOAD = True  # Disable CPU offload for better GPU utilization (RTX 5090 has 32GB VRAM)
 ALIGN_VOCABULARIES = True
 # Optional explicit per-GPU cap (GiB). If `None`, Trainer defaults to 20% of each GPU.
 MAX_GPU_MEM_GB = None
