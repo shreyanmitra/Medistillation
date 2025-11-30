@@ -47,7 +47,9 @@ print("="*80)
 print("🔐 HUGGINGFACE AUTHENTICATION")
 print("="*80)
 
-hf_token = ""
+import getpass
+
+hf_token = getpass.getpass("Enter your HuggingFace Token: ")
 login(token=hf_token)
 
 import time
