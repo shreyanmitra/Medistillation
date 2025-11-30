@@ -14,6 +14,7 @@ ENABLE_CPU_OFFLOAD = True  # Disable CPU offload for better GPU utilization (RTX
 ALIGN_VOCABULARIES = True
 # Optional explicit per-GPU cap (GiB). If `None`, Trainer defaults to 20% of each GPU.
 MAX_GPU_MEM_GB = None
+PREFER_4_BIT = True
 
 METHODS_TO_RUN = [
     "sft",        # Baseline: Supervised Fine-Tuning
@@ -191,6 +192,9 @@ for method_idx, method in enumerate(METHODS_TO_RUN, 1):
 
     if ALIGN_VOCABULARIES:
         cmd += " \\\n        --align_vocabularies"
+    
+    if PREFER_4_BIT:
+        cmd += " \\\n        --prefer_4bit"
 
     # If CPU offload is enabled and an explicit per-GPU cap is configured, pass it to Trainer
     if ENABLE_CPU_OFFLOAD and MAX_GPU_MEM_GB is not None:

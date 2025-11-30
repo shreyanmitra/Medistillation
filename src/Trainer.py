@@ -208,7 +208,7 @@ class TrainingConfig:
 # MODEL SETUP
 # ==============================================================================
 
-def setup_quantization_config(enable_cpu_offload: bool = False) -> BitsAndBytesConfig:
+def setup_quantization_config(enable_cpu_offload: bool = False, prefer_4bit: bool = False) -> BitsAndBytesConfig:
     """
     Configure 8-bit quantization for memory-efficient model loading.
     
@@ -220,6 +220,31 @@ def setup_quantization_config(enable_cpu_offload: bool = False) -> BitsAndBytesC
     :rtype: BitsAndBytesConfig
     """
 
+    # Probe for 4-bit support in the installed bitsandbytes/transformers stack.
+    def _supports_4bit() -> bool:
+        try:
+            BitsAndBytesConfig(load_in_4bit=True)
+            return True
+        except Exception:
+            return False
+
+    if prefer_4bit and _supports_4bit():
+        # Use 4-bit (NF4) config when requested and supported. This is more
+        # memory-efficient than 8-bit but requires a compatible bitsandbytes.
+        try:
+            import torch
+            return BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type='nf4',
+                bnb_4bit_compute_dtype=getattr(torch, 'float16', None),
+                llm_int8_enable_fp32_cpu_offload=enable_cpu_offload,
+            )
+        except Exception:
+            # Fall back to 8-bit if something unexpected fails during construction
+            pass
+
+    # Default: 8-bit QLoRA config (existing behavior)
     return BitsAndBytesConfig(
         load_in_8bit=True,
         llm_int8_threshold=6.0,
@@ -269,7 +294,8 @@ def load_teacher_model(
     model_name: str,
     use_quantization: bool = True,
     enable_cpu_offload: bool = False,
-    max_gpu_mem_gb: Optional[float] = None
+    max_gpu_mem_gb: Optional[float] = None,
+    prefer_4bit: bool = False
 ) -> nn.Module:
     """
     Load teacher model with optional quantization.
@@ -300,7 +326,7 @@ def load_teacher_model(
     if use_quantization:
         # Use 8-bit quantization to reduce memory footprint (QLoRA technique)
         # This allows loading large models (7B+ parameters) on consumer GPUs
-        quantization_config = setup_quantization_config(enable_cpu_offload=enable_cpu_offload)
+        quantization_config = setup_quantization_config(enable_cpu_offload=enable_cpu_offload, prefer_4bit=prefer_4bit)
         # Free cache and log before heavy load
         _log_and_clear_cuda("before_teacher_from_pretrained")
         try:
@@ -409,7 +435,8 @@ def load_student_model(
     lora_config: Optional[Dict[str, Any]] = None,
     use_quantization: bool = True, 
     enable_cpu_offload: bool = False,
-    max_gpu_mem_gb: Optional[float] = None
+    max_gpu_mem_gb: Optional[float] = None,
+    prefer_4bit: bool = False
 ) -> nn.Module:
     """
     Load student model with optional LoRA adapters.
@@ -446,7 +473,7 @@ def load_student_model(
         # This dramatically reduces memory usage while maintaining training quality
         # Pass enable_cpu_offload into the BitsAndBytesConfig so device_map="auto"
         # can offload FP32 parts to CPU when necessary.
-        quantization_config = setup_quantization_config(enable_cpu_offload=enable_cpu_offload)
+        quantization_config = setup_quantization_config(enable_cpu_offload=enable_cpu_offload, prefer_4bit=prefer_4bit)
         # Free cache and log before heavy load
         _log_and_clear_cuda("before_student_from_pretrained")
         try:
@@ -2942,6 +2969,8 @@ def main():
                         help='Use 8-bit quantization (QLoRA)')
     parser.add_argument('--enable_cpu_offload', action='store_true', default=False,
                         help='Enable CPU offloading for large teacher models (70B+)')
+    parser.add_argument('--prefer_4bit', action='store_true', default=False,
+                        help='Prefer 4-bit (bnb nf4) quantization when supported')
     parser.add_argument('--max_gpu_mem_gb', type=float, default=None,
                         help='Per-GPU hard limit in GiB; when set, loader will request device_map that keeps <= this on each GPU.\n'
                              'Note: setting this option requires --enable_cpu_offload to be set for safety.')
@@ -3042,7 +3071,8 @@ def main():
         config.teacher_model_name,
         use_quantization=config.use_quantization,
         enable_cpu_offload=config.enable_cpu_offload,
-        max_gpu_mem_gb=args.max_gpu_mem_gb
+        max_gpu_mem_gb=args.max_gpu_mem_gb,
+        prefer_4bit=args.prefer_4bit
     )
 
     lora_config_dict = {
@@ -3060,7 +3090,8 @@ def main():
         lora_config=lora_config_dict,
         use_quantization=config.use_quantization,
         enable_cpu_offload = config.enable_cpu_offload,
-        max_gpu_mem_gb=args.max_gpu_mem_gb
+        max_gpu_mem_gb=args.max_gpu_mem_gb,
+        prefer_4bit=args.prefer_4bit
     )
 
     # ===== Vocabulary Alignment for Logit-Based Methods =====
