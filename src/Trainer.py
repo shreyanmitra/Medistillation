@@ -3349,6 +3349,13 @@ def main():
         distillation_method=config.distillation_method,
         num_workers=config.num_workers
     )
+    # Log dataloader lengths for diagnostics (number of batches)
+    try:
+        train_len = len(train_dataloader)
+        val_len = len(val_dataloader)
+        logger.info(f"Train dataloader length (batches): {train_len}, Validation dataloader length (batches): {val_len}")
+    except Exception as e:
+        logger.warning(f"Could not determine dataloader lengths: {e}")
 
     # ===== Setup Optimizer =====
     # AdamW: Adam with weight decay (better regularization than standard Adam)
