@@ -1,5 +1,5 @@
-python -m venv .
-source./bin/activate
+python -m venv myenv
+source myenv/bin/activate
 pip install -r requirements.txt
 pip install plotly kaleido ipywidgets huggingface-hub pandas plotly
 python src/DataLoader.py --prepare_all
