@@ -77,6 +77,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def _log_and_clear_cuda(stage: str):
+    try:
+        if torch.cuda.is_available():
+            logger.info(f"[CUDA] {stage} - memory summary (abbrev):")
+            logger.info(torch.cuda.memory_summary(device=None, abbreviated=True))
+            torch.cuda.empty_cache()
+    except Exception as e:
+        logger.warning(f"Failed to log/clear CUDA at {stage}: {e}")
+
 
 # ==============================================================================
 # CONFIGURATION CLASS
@@ -127,6 +136,12 @@ class TrainingConfig:
         self.lora_dropout: float = args.lora_dropout
         self.use_quantization: bool = args.use_quantization
         self.enable_cpu_offload: bool = args.enable_cpu_offload  # For large teacher models (70B+)
+        # Misc runtime flags copied from CLI
+        self.resume_from_checkpoint: str = getattr(args, 'resume_from_checkpoint', '')
+        self.align_vocabularies: bool = getattr(args, 'align_vocabularies', False)
+        self.run_ablation: bool = getattr(args, 'run_ablation', False)
+        self.ablation_type: str = getattr(args, 'ablation_type', '')
+        self.ablation_values: str = getattr(args, 'ablation_values', '')
 
         # Method-specific hyperparameters
         self.alpha: float = args.alpha  # For Logit-KD, AdaKD, FitNets, Attention
@@ -221,20 +236,45 @@ def load_teacher_model(
         # Use 8-bit quantization to reduce memory footprint (QLoRA technique)
         # This allows loading large models (7B+ parameters) on consumer GPUs
         quantization_config = setup_quantization_config(enable_cpu_offload=enable_cpu_offload)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            quantization_config=quantization_config,  # Apply 8-bit quantization
-            device_map="auto",  # Automatically distribute across available devices
-            trust_remote_code=True  # Allow custom model code from HuggingFace
-        )
+        # Free cache and log before heavy load
+        _log_and_clear_cuda("before_teacher_from_pretrained")
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                quantization_config=quantization_config,  # Apply 8-bit quantization
+                device_map="auto",  # Automatically distribute across available devices
+                trust_remote_code=True  # Allow custom model code from HuggingFace
+            )
+            _log_and_clear_cuda("after_teacher_from_pretrained")
+        except Exception as e:
+            logger.exception("Failed to load teacher model with from_pretrained(): %s", e)
+            try:
+                if torch.cuda.is_available():
+                    logger.error("CUDA memory summary at teacher load failure:\n%s", torch.cuda.memory_summary(device=None, abbreviated=True))
+                    torch.cuda.empty_cache()
+            except Exception as e2:
+                logger.warning("Failed to capture CUDA memory summary after teacher load failure: %s", e2)
+            raise
     else:
         # Load in FP16 for faster inference without quantization
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="auto",  # Automatically distribute across available devices
-            torch_dtype=torch.float16,  # Use half precision for memory efficiency
-            trust_remote_code=True
-        )
+        _log_and_clear_cuda("before_teacher_from_pretrained")
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map="auto",  # Automatically distribute across available devices
+                torch_dtype=torch.float16,  # Use half precision for memory efficiency
+                trust_remote_code=True
+            )
+            _log_and_clear_cuda("after_teacher_from_pretrained")
+        except Exception as e:
+            logger.exception("Failed to load teacher model (fp16) with from_pretrained(): %s", e)
+            try:
+                if torch.cuda.is_available():
+                    logger.error("CUDA memory summary at teacher load failure (fp16):\n%s", torch.cuda.memory_summary(device=None, abbreviated=True))
+                    torch.cuda.empty_cache()
+            except Exception as e2:
+                logger.warning("Failed to capture CUDA memory summary after teacher fp16 load failure: %s", e2)
+            raise
 
     model.eval()  # Teacher is always in evaluation mode (no training, only inference)
     
@@ -302,22 +342,48 @@ def load_student_model(
         # Pass enable_cpu_offload into the BitsAndBytesConfig so device_map="auto"
         # can offload FP32 parts to CPU when necessary.
         quantization_config = setup_quantization_config(enable_cpu_offload=enable_cpu_offload)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            quantization_config=quantization_config,  # Quantize frozen weights to 8-bit
-            device_map="auto",
-            trust_remote_code=True
-        )
-        # Prepare for k-bit training: enables gradient checkpointing and input requires_grad
-        model = prepare_model_for_kbit_training(model)
+        # Free cache and log before heavy load
+        _log_and_clear_cuda("before_student_from_pretrained")
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                quantization_config=quantization_config,  # Quantize frozen weights to 8-bit
+                device_map="auto",
+                trust_remote_code=True
+            )
+            _log_and_clear_cuda("after_student_from_pretrained")
+            # Prepare for k-bit training: enables gradient checkpointing and input requires_grad
+            model = prepare_model_for_kbit_training(model)
+            _log_and_clear_cuda("after_prepare_kbit")
+        except Exception as e:
+            logger.exception("Failed to load student model with from_pretrained() (quantized): %s", e)
+            try:
+                if torch.cuda.is_available():
+                    logger.error("CUDA memory summary at student quantized load failure:\n%s", torch.cuda.memory_summary(device=None, abbreviated=True))
+                    torch.cuda.empty_cache()
+            except Exception as e2:
+                logger.warning("Failed to capture CUDA memory summary after student quantized load failure: %s", e2)
+            raise
     else:
         # Standard loading in FP16 (no quantization)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="auto",
-            torch_dtype=torch.float16,
-            trust_remote_code=True
-        )
+        _log_and_clear_cuda("before_student_from_pretrained")
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map="auto",
+                torch_dtype=torch.float16,
+                trust_remote_code=True
+            )
+            _log_and_clear_cuda("after_student_from_pretrained")
+        except Exception as e:
+            logger.exception("Failed to load student model with from_pretrained() (fp16): %s", e)
+            try:
+                if torch.cuda.is_available():
+                    logger.error("CUDA memory summary at student fp16 load failure:\n%s", torch.cuda.memory_summary(device=None, abbreviated=True))
+                    torch.cuda.empty_cache()
+            except Exception as e2:
+                logger.warning("Failed to capture CUDA memory summary after student fp16 load failure: %s", e2)
+            raise
 
     if use_lora:
         logger.info("Applying LoRA adapters")
@@ -335,7 +401,9 @@ def load_student_model(
             }
 
         peft_config = LoraConfig(**lora_config)
+        _log_and_clear_cuda("before_get_peft_model")
         model = get_peft_model(model, peft_config)  # Wrap model with LoRA adapters
+        _log_and_clear_cuda("after_get_peft_model")
         model.print_trainable_parameters()  # Log how many parameters are trainable
 
     # Check CUDA availability
@@ -2059,7 +2127,13 @@ class Trainer:
             )
             baseline_model.eval()
         except Exception as e:
-            logger.error(f"Failed to load baseline model: {e}")
+            logger.exception(f"Failed to load baseline model: {e}")
+            try:
+                if torch.cuda.is_available():
+                    logger.error("CUDA memory summary at baseline load failure:\n%s", torch.cuda.memory_summary(device=None, abbreviated=True))
+                    torch.cuda.empty_cache()
+            except Exception as e2:
+                logger.warning("Failed to capture CUDA memory summary after baseline load failure: %s", e2)
             logger.warning("Skipping baseline comparison...")
             return {}
         
@@ -2521,11 +2595,13 @@ def run_ablation_study(
             )
             
             # Setup optimizer and scheduler
+            _log_and_clear_cuda("before_ablation_optimizer_creation")
             optimizer = torch.optim.AdamW(
                 student_model.parameters(),
                 lr=config_copy.learning_rate,
                 weight_decay=config_copy.weight_decay
             )
+            _log_and_clear_cuda("after_ablation_optimizer_creation")
             
             total_steps = len(train_dataloader) * config_copy.num_epochs // config_copy.gradient_accumulation_steps
             scheduler = get_linear_schedule_with_warmup(
@@ -2737,6 +2813,8 @@ def main():
                         help='Automatically align student vocabulary to match teacher by adding extra tokens. '
                              'Required when teacher and student have different vocabulary sizes for logit-based methods. '
                              'Example: Meditron-70B (32,017 tokens) → Llama-2-7B (32,000 tokens) adds 17 medical tokens.')
+    parser.add_argument('--no_align_vocabularies', dest='align_vocabularies', action='store_false',
+                        help='Disable automatic vocabulary alignment (opposite of --align_vocabularies)')
 
     # Method-specific arguments
     parser.add_argument('--alpha', type=float, default=0.5,
@@ -2861,7 +2939,7 @@ def main():
             logger.info(f"Student vocab size: {student_vocab_size:,}")
             logger.info(f"Difference:         {abs(teacher_vocab_size - student_vocab_size):,} tokens")
             
-            if args.align_vocabularies:
+            if config.align_vocabularies:
                 logger.info("\n✅ --align_vocabularies flag detected")
                 logger.info("   Proceeding with automatic vocabulary expansion...\n")
                 
@@ -3015,11 +3093,13 @@ def main():
 
     # ===== Setup Optimizer =====
     # AdamW: Adam with weight decay (better regularization than standard Adam)
+    _log_and_clear_cuda("before_optimizer_creation")
     optimizer = torch.optim.AdamW(
         student_model.parameters(),  # Only student parameters are trainable
         lr=config.learning_rate,
         weight_decay=config.weight_decay  # L2 regularization
     )
+    _log_and_clear_cuda("after_optimizer_creation")
 
     # ===== Setup Learning Rate Scheduler =====
     # Warmup followed by linear decay (standard for LLM fine-tuning)
@@ -3034,13 +3114,13 @@ def main():
     logger.info(f"Total training steps: {total_steps}")
 
     # ===== Check if Running Ablation Study =====
-    if args.run_ablation:
+    if config.run_ablation:
         logger.info("\n" + "="*80)
         logger.info("ABLATION STUDY MODE")
         logger.info("="*80 + "\n")
         
         # Parse ablation values
-        if not args.ablation_values:
+        if not config.ablation_values:
             # Default values for each ablation type
             default_values = {
                 'temperature': [2.0, 3.0, 4.0, 5.0],
@@ -3048,16 +3128,16 @@ def main():
                 'lora_rank': [8, 16, 32, 64],
                 'learning_rate': [1e-4, 2e-4, 3e-4, 5e-4]
             }
-            ablation_values = default_values.get(args.ablation_type, [])
+            ablation_values = default_values.get(config.ablation_type, [])
         else:
             # Parse user-provided values
-            value_strings = args.ablation_values.split(',')
-            if args.ablation_type in ['lora_rank']:
+            value_strings = config.ablation_values.split(',')
+            if config.ablation_type in ['lora_rank']:
                 ablation_values = [int(v.strip()) for v in value_strings]
             else:
                 ablation_values = [float(v.strip()) for v in value_strings]
         
-        logger.info(f"Running ablation on: {args.ablation_type}")
+        logger.info(f"Running ablation on: {config.ablation_type}")
         logger.info(f"Testing values: {ablation_values}")
         
         # Map ablation type to parameter name
@@ -3099,8 +3179,8 @@ def main():
     )
 
     # Resume from checkpoint if requested
-    if getattr(args, 'resume_from_checkpoint', None):
-        resume_path = args.resume_from_checkpoint
+    if getattr(config, 'resume_from_checkpoint', None):
+        resume_path = config.resume_from_checkpoint
         logger.info(f"Resuming training from checkpoint: {resume_path}")
         trainer.load_checkpoint(resume_path, load_optimizer=True)
 

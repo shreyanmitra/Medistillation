@@ -244,7 +244,7 @@ for method_idx, method in enumerate(METHODS_TO_RUN, 1):
     print(f"💡 Tip: Check GPU utilization with: !nvidia-smi")
     print("-" * 80)
 
-    import subprocess
+    import subprocess, shutil
     import sys
     
     # Run training with real-time output streaming to show progress bars
@@ -254,6 +254,48 @@ for method_idx, method in enumerate(METHODS_TO_RUN, 1):
     
     # Use Popen to stream output in real-time so tqdm progress bars are visible
     # Note: tqdm works best when output is a TTY, so we'll stream directly
+    env = os.environ.copy()
+    env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+    # Prepare per-method launcher log directory
+    launcher_dir = os.path.join(output_dir, "launcher_logs")
+    os.makedirs(launcher_dir, exist_ok=True)
+    launcher_log = os.path.join(launcher_dir, "launcher.log")
+    stdout_log = os.path.join(launcher_dir, "launcher_stdout.log")
+    error_tail_log = os.path.join(launcher_dir, "launcher_error_tail.log")
+
+    # Record launch metadata (command, env, GPU state)
+    with open(launcher_log, 'a', encoding='utf-8') as lf:
+        lf.write(f"\n===== LAUNCH {datetime.now().isoformat()} =====\n")
+        # Don't log secrets; mask HF token if present
+        safe_cmd = cmd
+        try:
+            if 'hf_token' in globals() and hf_token:
+                safe_cmd = safe_cmd.replace(hf_token, '<HF_TOKEN>')
+        except Exception:
+            pass
+        lf.write(f"COMMAND: {safe_cmd}\n")
+        lf.write(f"PYTORCH_CUDA_ALLOC_CONF={env.get('PYTORCH_CUDA_ALLOC_CONF')}\n")
+        # Capture nvidia-smi output if available
+        try:
+            nvs = subprocess.check_output(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu", "--format=csv,noheader,nounits"]) 
+            lf.write("nvidia-smi:\n")
+            lf.write(nvs.decode('utf-8').strip() + "\n")
+        except Exception as e:
+            lf.write(f"nvidia-smi not available: {e}\n")
+        # Torch quick info
+        try:
+            import torch as _torch
+            lf.write(f"torch.cuda.is_available={_torch.cuda.is_available()}, device_count={_torch.cuda.device_count()}\n")
+            if _torch.cuda.is_available():
+                try:
+                    lf.write(_torch.cuda.memory_summary(device=None, abbreviated=True) + "\n")
+                except Exception:
+                    lf.write("torch.cuda.memory_summary unavailable\n")
+        except Exception:
+            lf.write("torch not available in launcher context\n")
+
+    # Launch subprocess (child will inherit env)
     process = subprocess.Popen(
         cmd,
         shell=True,
@@ -261,39 +303,56 @@ for method_idx, method in enumerate(METHODS_TO_RUN, 1):
         stderr=subprocess.STDOUT,  # Merge stderr into stdout
         text=True,
         bufsize=1,  # Line buffered for real-time output
-        universal_newlines=True
+        universal_newlines=True,
+        env=env
     )
-    
-    # Stream output in real-time to show progress bars
+
+    # Stream and persist stdout/stderr
     output_lines = []
-    try:
-        # Read line by line and print immediately
-        while True:
-            output = process.stdout.readline()
-            if output == '' and process.poll() is not None:
-                break
-            if output:
-                print(output, end='', flush=True)  # Print immediately
-                output_lines.append(output)
-    except KeyboardInterrupt:
-        process.terminate()
-        print("\n⚠️  Training interrupted by user")
-        raise
-    
+    with open(stdout_log, 'a', encoding='utf-8') as out_f:
+        try:
+            while True:
+                line = process.stdout.readline()
+                if line == '' and process.poll() is not None:
+                    break
+                if line:
+                    # Mirror to console and file
+                    print(line, end='', flush=True)
+                    out_f.write(line)
+                    out_f.flush()
+                    output_lines.append(line)
+        except KeyboardInterrupt:
+            process.terminate()
+            print("\n⚠️  Training interrupted by user")
+            raise
+
     # Wait for process to complete and get return code
     return_code = process.poll()
-    
-    # Store full output for error reporting
-    full_output = ''.join(output_lines)
-    
-    # Check if training failed
+
+    # On failure, save last chunk and capture GPU state again
     if return_code != 0:
+        # Save last ~200 lines to error_tail_log for quick debugging
+        tail = ''.join(output_lines[-200:])
+        try:
+            with open(error_tail_log, 'w', encoding='utf-8') as ef:
+                ef.write(tail)
+        except Exception:
+            pass
+
+        with open(launcher_log, 'a', encoding='utf-8') as lf:
+            lf.write(f"\nTRAINER FAILED (rc={return_code}) at {datetime.now().isoformat()}\n")
+            lf.write("Last output tail:\n")
+            lf.write(tail + "\n")
+            # Capture nvidia-smi again
+            try:
+                nvs2 = subprocess.check_output(["nvidia-smi", "--query-compute-apps=pid,used_gpu_memory,process_name", "--format=csv,noheader,nounits"]) 
+                lf.write("nvidia-smi (post-fail):\n")
+                lf.write(nvs2.decode('utf-8').strip() + "\n")
+            except Exception as e:
+                lf.write(f"nvidia-smi post-fail not available: {e}\n")
+
         print(f"\n❌ ERROR: Training failed with return code {return_code}")
-        if full_output:
-            # Show last 50 lines of output for debugging
-            error_lines = full_output.split('\n')[-50:]
-            print("\nLast 50 lines of output:")
-            print('\n'.join(error_lines))
+        print(f"Last {min(200, len(output_lines))} lines saved to: {error_tail_log}")
         print("Continuing with next method...\n")
 
     # Calculate elapsed time
