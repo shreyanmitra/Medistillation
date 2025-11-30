@@ -77,6 +77,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Set PyTorch CUDA allocator settings to reduce fragmentation and allow
+# expandable segments. `PYTORCH_CUDA_ALLOC_CONF` is deprecated in favor of
+# `PYTORCH_ALLOC_CONF` but we set both for compatibility on older environments.
+# These defaults can be overridden by the environment when launching the job.
+os.environ.setdefault(
+    "PYTORCH_ALLOC_CONF",
+    "max_split_size_mb:128,garbage_collection_threshold:0.6"
+)
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "expandable_segments:True,max_split_size_mb:128"
+)
+logger.info(f"PYTORCH_ALLOC_CONF={os.environ.get('PYTORCH_ALLOC_CONF')}")
+logger.info(f"PYTORCH_CUDA_ALLOC_CONF={os.environ.get('PYTORCH_CUDA_ALLOC_CONF')}")
+
 def _log_and_clear_cuda(stage: str):
     try:
         if torch.cuda.is_available():

@@ -6,8 +6,8 @@ STUDENT_MODEL = "meta-llama/Llama-2-7b-hf"
 BASELINE_MODEL = "epfl-llm/meditron-7b"
 
 NUM_EPOCHS = 3
-BATCH_SIZE = 4
-GRADIENT_ACCUMULATION = 2
+BATCH_SIZE = 1
+GRADIENT_ACCUMULATION = 1
 LEARNING_RATE = 1e-4 
 
 ENABLE_CPU_OFFLOAD = True  # Disable CPU offload for better GPU utilization (RTX 5090 has 32GB VRAM)
