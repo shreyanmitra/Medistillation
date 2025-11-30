@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-TEACHER_MODEL = "google/medgemma-27b-it"
-STUDENT_MODEL = "google/gemma-3-4b-it"
-BASELINE_MODEL = "google/medgemma-4b-it"
+TEACHER_MODEL = "epfl-llm/meditron-7b"
+STUDENT_MODEL = "TinyLlama/TinyLlama_v1.1"
+BASELINE_MODEL = "epfl-llm/meditron-7b"
+# Toggle to control whether launcher asks Trainer to run baseline evaluation
+# Set to True to pass --baseline_model and --run_baseline to Trainer
+RUN_BASELINE = False
 
 NUM_EPOCHS = 3
 BATCH_SIZE = 1
 GRADIENT_ACCUMULATION = 1
 LEARNING_RATE = 1e-4 
 
-ENABLE_CPU_OFFLOAD = True  # Disable CPU offload for better GPU utilization (RTX 5090 has 32GB VRAM)
+ENABLE_CPU_OFFLOAD = False  # Disable CPU offload for better GPU utilization (RTX 5090 has 32GB VRAM)
 ALIGN_VOCABULARIES = True
 # Optional explicit per-GPU cap (GiB). If `None`, Trainer defaults to 20% of each GPU.
 MAX_GPU_MEM_GB = None
-PREFER_4_BIT = True
+PREFER_4_BIT = False
 
 METHODS_TO_RUN = [
     "sft",        # Baseline: Supervised Fine-Tuning
@@ -29,7 +32,7 @@ print("EXPERIMENT CONFIGURATION: DISTILLATION EFFICIENCY STUDY")
 print("="*80)
 print(f"🎓 Teacher Model:  {TEACHER_MODEL}")
 print(f"👨‍🎓 Student Model:  {STUDENT_MODEL}")
-print(f"📊 Baseline Model: {BASELINE_MODEL} (comparison target)")
+print(f"📊 Baseline Model: {BASELINE_MODEL} (comparison target) | RUN_BASELINE={RUN_BASELINE}")
 print(f"\n📚 Training Settings:")
 print(f"  • Epochs: {NUM_EPOCHS}")
 print(f"  • Batch Size: {BATCH_SIZE}")
@@ -195,6 +198,13 @@ for method_idx, method in enumerate(METHODS_TO_RUN, 1):
     
     if PREFER_4_BIT:
         cmd += " \\\n        --prefer_4bit"
+
+    # Pass baseline args to Trainer when requested by this launcher
+    if RUN_BASELINE:
+        # If a baseline model ID is provided, pass it; otherwise Trainer will skip if empty
+        if BASELINE_MODEL:
+            cmd += f" \\\n+        --baseline_model {BASELINE_MODEL}"
+        cmd += " \\\n+        --run_baseline"
 
     # If CPU offload is enabled and an explicit per-GPU cap is configured, pass it to Trainer
     if ENABLE_CPU_OFFLOAD and MAX_GPU_MEM_GB is not None:

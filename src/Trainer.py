@@ -159,6 +159,9 @@ class TrainingConfig:
         self.run_ablation: bool = getattr(args, 'run_ablation', False)
         self.ablation_type: str = getattr(args, 'ablation_type', '')
         self.ablation_values: str = getattr(args, 'ablation_values', '')
+        # Baseline evaluation settings
+        self.baseline_model_name: str = getattr(args, 'baseline_model', '')
+        self.run_baseline: bool = getattr(args, 'run_baseline', False)
 
         # Method-specific hyperparameters
         self.alpha: float = args.alpha  # For Logit-KD, AdaKD, FitNets, Attention
@@ -2663,9 +2666,9 @@ class Trainer:
             logger.warning(f"FidelityBench-Med not found at {fidelitybench_path}, skipping...")
         
         # 5. Baseline comparison (Distillation vs Direct Fine-Tuning)
-        # Compare your distilled Llama-2-7B against Meditron-7B (directly fine-tuned on 48B tokens)
-        baseline_model_name = "epfl-llm/meditron-7b"
-        if any(os.path.exists(p) for p in benchmark_paths.values()):
+        # Use CLI/config-controlled baseline name and flag (self.config.run_baseline)
+        baseline_model_name = getattr(self.config, 'baseline_model_name', '')
+        if getattr(self.config, 'run_baseline', False) and baseline_model_name and any(os.path.exists(p) for p in benchmark_paths.values()):
             logger.info("\n" + "="*80)
             logger.info("RUNNING BASELINE COMPARISON EXPERIMENT")
             logger.info(f"Comparing distilled model vs {baseline_model_name}")
@@ -2673,7 +2676,10 @@ class Trainer:
             baseline_results = self.evaluate_baseline_comparison(baseline_model_name, benchmark_paths)
             all_results['baseline_comparison'] = baseline_results
         else:
-            logger.warning("No benchmarks available for baseline comparison, skipping...")
+            if not getattr(self.config, 'run_baseline', False) or not baseline_model_name:
+                logger.info("Baseline comparison skipped (run_baseline=False or baseline_model not provided).")
+            else:
+                logger.warning("No benchmarks available for baseline comparison, skipping...")
         
         # 6. Save comprehensive results
         comprehensive_path = os.path.join(self.config.results_dir, "comprehensive_evaluation.json")
@@ -2995,6 +3001,10 @@ def main():
                         help='Teacher model name or path')
     parser.add_argument('--student_model', type=str, default='Qwen/Qwen2-1.5B',
                         help='Student model name or path')
+    parser.add_argument('--baseline_model', type=str, default='',
+                        help='Baseline model name or path (for comparison)')
+    parser.add_argument('--run_baseline', action='store_true', default=False,
+                        help='Whether to run baseline model evaluation')
 
     # Data arguments
     parser.add_argument('--train_data', type=str,
