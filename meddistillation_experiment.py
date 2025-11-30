@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-TEACHER_MODEL = "epfl-llm/meditron-70b"
-STUDENT_MODEL = "meta-llama/Llama-2-7b-hf"  
-BASELINE_MODEL = "epfl-llm/meditron-7b"
+TEACHER_MODEL = "google/medgemma-27b-it"
+STUDENT_MODEL = "google/gemma-3-4b-it"
+BASELINE_MODEL = "google/medgemma-4b-it"
 
 NUM_EPOCHS = 3
 BATCH_SIZE = 1
