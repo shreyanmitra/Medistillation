@@ -790,7 +790,8 @@ class Trainer:
         This method is a no-op when sampling is disabled or when a fixed sampled dataloader
         was already created before training.
         """
-        if self.config.max_train_samples_per_epoch is None:
+        # Quick check: if raw sampling config is not set (0 or None) then do nothing
+        if getattr(self.config, 'max_train_samples_per_epoch_raw', 0) in (0, None):
             return
 
         # If resampling each epoch, create a new Subset with deterministic seed base + epoch
