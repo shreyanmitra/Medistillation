@@ -2733,7 +2733,7 @@ def main():
                         help='Enable CPU offloading for large teacher models (70B+)')
     parser.add_argument('--resume_from_checkpoint', type=str, default='',
                         help='Path to checkpoint file to resume training from (optional)')
-    parser.add_argument('--align_vocabularies', action='store_true', default=False,
+    parser.add_argument('--align_vocabularies', action='store_true', default=True,
                         help='Automatically align student vocabulary to match teacher by adding extra tokens. '
                              'Required when teacher and student have different vocabulary sizes for logit-based methods. '
                              'Example: Meditron-70B (32,017 tokens) → Llama-2-7B (32,000 tokens) adds 17 medical tokens.')
