@@ -233,24 +233,40 @@ def setup_quantization_config(enable_cpu_offload: bool = False, prefer_4bit: boo
         # memory-efficient than 8-bit but requires a compatible bitsandbytes.
         try:
             import torch
-            return BitsAndBytesConfig(
+            cfg = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type='nf4',
                 bnb_4bit_compute_dtype=getattr(torch, 'float16', None),
                 llm_int8_enable_fp32_cpu_offload=enable_cpu_offload,
             )
+            # Tag and log the selected mode so runtime logs can unambiguously
+            # report whether 4-bit or 8-bit was chosen.
+            try:
+                setattr(cfg, 'requested_kbit', '4bit')
+            except Exception:
+                # If the object doesn't allow setting attributes, ignore silently
+                pass
+            logger.info("Quantization configured: requested 4-bit (nf4). Config: %s", cfg)
+            return cfg
         except Exception:
+            logger.exception("Failed to construct 4-bit BitsAndBytesConfig, falling back to 8-bit")
             # Fall back to 8-bit if something unexpected fails during construction
             pass
 
     # Default: 8-bit QLoRA config (existing behavior)
-    return BitsAndBytesConfig(
+    cfg = BitsAndBytesConfig(
         load_in_8bit=True,
         llm_int8_threshold=6.0,
         llm_int8_has_fp16_weight=False,
         llm_int8_enable_fp32_cpu_offload=enable_cpu_offload,  # Enable CPU offload for 70B models
     )
+    try:
+        setattr(cfg, 'requested_kbit', '8bit')
+    except Exception:
+        pass
+    logger.info("Quantization configured: selected 8-bit fallback. Config: %s", cfg)
+    return cfg
 
 
 def compute_max_memory_dict(per_gpu_limit_gb: Optional[float] = None, reserve_cpu_gb: int = 64) -> dict:
