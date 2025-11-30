@@ -19,7 +19,14 @@ ALIGN_VOCABULARIES = True
 MAX_GPU_MEM_GB = None
 PREFER_4_BIT = False
 # Toggle to set CUDA_LAUNCH_BLOCKING=1 for deterministic CUDA errors/debugging
-ENABLE_CUDA_LAUNCH_BLOCKING = False
+ENABLE_CUDA_LAUNCH_BLOCKING = True
+
+# Sampling control: integer (e.g. 20000) or fraction (e.g. 0.05 for 5% of dataset). 0 disables sampling.
+MAX_TRAIN_SAMPLES_PER_EPOCH = 5000
+# If True, resample the subset each epoch (deterministic with SAMPLING_SEED)
+RESAMPLE_TRAIN_SAMPLES_EACH_EPOCH = True
+# Base seed for deterministic per-epoch resampling
+SAMPLING_SEED = 42
 
 METHODS_TO_RUN = [
     "sft",        # Baseline: Supervised Fine-Tuning
@@ -202,6 +209,13 @@ for method_idx, method in enumerate(METHODS_TO_RUN, 1):
     if PREFER_4_BIT:
         cmd += " \\\n        --prefer_4bit"
 
+        # Pass sampling args to Trainer when requested by this launcher
+        if MAX_TRAIN_SAMPLES_PER_EPOCH:
+            cmd += f" \\\n        --max_train_samples_per_epoch {MAX_TRAIN_SAMPLES_PER_EPOCH}"
+            # Pass sampling seed (helps reproducibility)
+            cmd += f" \\\n        --sampling_seed {SAMPLING_SEED}"
+        if RESAMPLE_TRAIN_SAMPLES_EACH_EPOCH:
+            cmd += " \\\n        --resample_train_samples_each_epoch"
     # Pass baseline args to Trainer when requested by this launcher
     if RUN_BASELINE:
         # If a baseline model ID is provided, pass it; otherwise Trainer will skip if empty

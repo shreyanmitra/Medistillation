@@ -38,6 +38,7 @@ import numpy as np
 
 # PyTorch imports
 import torch
+import math
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -196,6 +197,40 @@ class TrainingConfig:
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
         Path(self.checkpoint_dir).mkdir(parents=True, exist_ok=True)
         Path(self.results_dir).mkdir(parents=True, exist_ok=True)
+        # Sampling options (optional: limit epoch size for very large datasets)
+        # Store the raw CLI value which may be a fraction (0.0-1.0) or absolute >1.
+        # A value of 0 or None disables sampling.
+        self.max_train_samples_per_epoch_raw = getattr(args, 'max_train_samples_per_epoch', 0)
+        if self.max_train_samples_per_epoch_raw is None:
+            self.max_train_samples_per_epoch_raw = 0
+        self.resample_train_samples_each_epoch: bool = getattr(args, 'resample_train_samples_each_epoch', False)
+        self.sampling_seed: int = getattr(args, 'sampling_seed', 42)
+
+    def resolve_max_train_samples(self, dataset_len: int) -> Optional[int]:
+        """Resolve the raw `max_train_samples_per_epoch_raw` into an integer sample size.
+
+        - If raw is 0 or None -> returns None (no sampling)
+        - If 0 < raw <= 1.0 -> treat as fraction of dataset_len (floor), at least 1
+        - If raw > 1 -> treat as absolute sample count (clamped to dataset_len)
+        """
+        raw = self.max_train_samples_per_epoch_raw
+        try:
+            val = float(raw)
+        except Exception:
+            return None
+
+        if val <= 0:
+            return None
+
+        # Fractional case (proportion of dataset)
+        if 0 < val <= 1.0:
+            # floor to integer but ensure at least 1
+            count = max(1, int(math.floor(val * float(dataset_len))))
+            return min(count, dataset_len)
+
+        # Absolute count case
+        count = int(math.floor(val))
+        return min(max(1, count), dataset_len)
 
     def to_dict(self) -> Dict[str, Any]:
         """
@@ -737,6 +772,61 @@ class Trainer:
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.tokenizer = tokenizer or distillation_method.tokenizer
+        # Keep reference to the original dataset so we can resample per-epoch if requested
+        try:
+            self._original_train_dataset = train_dataloader.dataset
+        except Exception:
+            self._original_train_dataset = None
+
+        # Store initial dataloader settings for rebuilding sampled dataloaders
+        self._initial_collate_fn = getattr(train_dataloader, 'collate_fn', None)
+        self._initial_num_workers = config.num_workers
+        self._initial_pin_memory = True if torch.cuda.is_available() else False
+
+    def _maybe_refresh_train_dataloader(self, epoch: int):
+        """
+        If per-epoch resampling is enabled, rebuild `self.train_dataloader` for the given epoch.
+
+        This method is a no-op when sampling is disabled or when a fixed sampled dataloader
+        was already created before training.
+        """
+        if self.config.max_train_samples_per_epoch is None:
+            return
+
+        # If resampling each epoch, create a new Subset with deterministic seed base + epoch
+        if self.config.resample_train_samples_each_epoch:
+            if self._original_train_dataset is None:
+                logger.warning("Resample requested but original train dataset unavailable; skipping resample.")
+                return
+            try:
+                import numpy as _np
+                from torch.utils.data import Subset
+                rng = _np.random.RandomState(self.config.sampling_seed + int(epoch))
+                dataset_len = len(self._original_train_dataset)
+                resolved = self.config.resolve_max_train_samples(dataset_len)
+                if resolved is None:
+                    return
+                sample_size = min(int(resolved), dataset_len)
+                indices = rng.choice(dataset_len, size=sample_size, replace=False)
+                sampled_dataset = Subset(self._original_train_dataset, indices.tolist())
+
+                self.train_dataloader = DataLoader(
+                    sampled_dataset,
+                    batch_size=self.config.batch_size,
+                    shuffle=True,
+                    num_workers=self._initial_num_workers,
+                    collate_fn=self._initial_collate_fn,
+                    pin_memory=self._initial_pin_memory,
+                    persistent_workers=True if self._initial_num_workers > 0 else False,
+                    prefetch_factor=2 if self._initial_num_workers > 0 else None,
+                    drop_last=False
+                )
+                logger.info(f"Epoch {epoch+1}: created resampled train dataloader with {len(sampled_dataset)} examples ({len(self.train_dataloader)} batches)")
+            except Exception as e:
+                logger.warning(f"Failed to resample train dataloader for epoch {epoch}: {e}")
+        else:
+            # Fixed sampled dataloader case is handled earlier in main() where train_dataloader was replaced.
+            return
 
         self.global_step = 0
         self.best_val_loss = float('inf')
@@ -770,6 +860,12 @@ class Trainer:
             logger.info(f"\n{'='*80}")
             logger.info(f"Epoch {epoch + 1}/{self.config.num_epochs}")
             logger.info(f"{'='*80}")
+
+            # If requested, refresh train dataloader (resample per-epoch)
+            try:
+                self._maybe_refresh_train_dataloader(epoch)
+            except Exception as e:
+                logger.warning(f"Error while refreshing train dataloader for epoch {epoch}: {e}")
 
             # Training phase
             train_metrics = self.train_epoch(epoch)
@@ -3115,6 +3211,16 @@ def main():
     parser.add_argument('--num_workers', type=int, default=8,
                         help='Number of data loading workers (increase for better GPU utilization)')
 
+    # Sampling options to truncate epoch size for very large datasets
+    parser.add_argument('--max_train_samples_per_epoch', type=float, default=0,
+                        help=('If >0, limit the number of training examples seen per epoch. ' 
+                              'Accepts an absolute integer (e.g. 20000) or a fraction in (0,1] ' 
+                              '(e.g. 0.1 for 10% of dataset). 0 or omitted means no sampling.'))
+    parser.add_argument('--resample_train_samples_each_epoch', action='store_true', default=False,
+                        help='If set, resample the subset of training examples each epoch (otherwise the subset is fixed once).')
+    parser.add_argument('--sampling_seed', type=int, default=42,
+                        help='Base RNG seed used for deterministic per-epoch resampling when enabled.')
+
     # Ablation study arguments
     parser.add_argument('--run_ablation', action='store_true',
                         help='Run ablation study instead of single training')
@@ -3357,6 +3463,51 @@ def main():
     except Exception as e:
         logger.warning(f"Could not determine dataloader lengths: {e}")
 
+    # Determine effective training size for scheduler and optional sampling
+    try:
+        dataset_len = len(train_dataloader.dataset)
+    except Exception:
+        dataset_len = None
+
+    # Resolve configured sampling into an integer (None if disabled)
+    resolved_max = None
+    if dataset_len is not None:
+        resolved_max = config.resolve_max_train_samples(dataset_len)
+
+    effective_train_examples = dataset_len
+    if resolved_max is not None:
+        effective_train_examples = min(resolved_max, dataset_len if dataset_len is not None else resolved_max)
+
+    # If user requested a fixed sampled subset, construct it now (deterministic sampling)
+    if resolved_max is not None and not config.resample_train_samples_each_epoch:
+        logger.info(f"Sampling a fixed subset of {effective_train_examples} examples for each epoch (seed={config.sampling_seed})")
+        try:
+            import numpy as _np
+            rng = _np.random.RandomState(config.sampling_seed)
+            indices = rng.choice(dataset_len, size=int(effective_train_examples), replace=False)
+            from torch.utils.data import Subset
+            sampled_dataset = Subset(train_dataloader.dataset, indices.tolist())
+
+            # Recreate dataloader using the same collate_fn and common DataLoader settings
+            sampled_train_dataloader = DataLoader(
+                sampled_dataset,
+                batch_size=config.batch_size,
+                shuffle=True,
+                num_workers=config.num_workers,
+                collate_fn=getattr(train_dataloader, 'collate_fn', None),
+                pin_memory=True if torch.cuda.is_available() else False,
+                persistent_workers=True if config.num_workers > 0 else False,
+                prefetch_factor=2 if config.num_workers > 0 else None,
+                drop_last=False
+            )
+            train_dataloader = sampled_train_dataloader
+            logger.info(f"Created sampled train dataloader with {len(sampled_dataset)} examples ({len(train_dataloader)} batches)")
+        except Exception as e:
+            logger.warning(f"Failed to create fixed sampled dataloader: {e}")
+    elif resolved_max is not None and config.resample_train_samples_each_epoch:
+        logger.info(f"Will resample {resolved_max} training examples each epoch (seed={config.sampling_seed})")
+
+
     # ===== Setup Optimizer =====
     # AdamW: Adam with weight decay (better regularization than standard Adam)
     _log_and_clear_cuda("before_optimizer_creation")
@@ -3369,8 +3520,17 @@ def main():
 
     # ===== Setup Learning Rate Scheduler =====
     # Warmup followed by linear decay (standard for LLM fine-tuning)
-    total_steps = len(train_dataloader) * \
-        config.num_epochs // config.gradient_accumulation_steps  # Total optimizer updates
+    # Compute effective number of batches per epoch (respect `max_train_samples_per_epoch` when set)
+    if resolved_max is not None and effective_train_examples is not None:
+        effective_batches_per_epoch = math.ceil(float(effective_train_examples) / float(config.batch_size))
+    else:
+        try:
+            effective_batches_per_epoch = len(train_dataloader)
+        except Exception:
+            # Fallback: assume at least one batch
+            effective_batches_per_epoch = 1
+
+    total_steps = effective_batches_per_epoch * config.num_epochs // config.gradient_accumulation_steps  # Total optimizer updates
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=config.warmup_steps,  # Gradually increase LR from 0
