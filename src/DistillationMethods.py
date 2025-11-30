@@ -253,6 +253,10 @@ class StandardSFT(BaseDistillationMethod):
         # Generate teacher responses on-the-fly (online distillation)
         # Use inference_mode instead of no_grad for better performance
         with torch.inference_mode():
+            # Disable KV cache to reduce peak GPU memory during teacher generation.
+            # This prevents large KV-cache allocations + temporary int32 buffers
+            # (e.g., from bitsandbytes int8 kernels) from causing OOMs when
+            # the trainer already consumes most GPU memory.
             full_sequence = self.teacher_model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -260,7 +264,7 @@ class StandardSFT(BaseDistillationMethod):
                 do_sample=False,  # Greedy decoding for consistency
                 pad_token_id=self.tokenizer.pad_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
-                use_cache=True,  # Enable KV cache for faster generation
+                use_cache=False,  # Disable KV cache to lower peak GPU memory
                 num_beams=1  # Greedy decoding (no beam search overhead)
             )
             
@@ -398,6 +402,8 @@ class LogitKD(BaseDistillationMethod):
         # Generate teacher responses on-the-fly (online distillation)
         # Use inference_mode instead of no_grad for better performance
         with torch.inference_mode():
+            # Disable KV cache to reduce peak GPU memory during teacher generation.
+            # See comment above for rationale (prevents OOM with int8 kernels).
             # Use optimized generation settings for faster inference
             full_sequence = self.teacher_model.generate(
                 input_ids=input_ids,
@@ -406,7 +412,7 @@ class LogitKD(BaseDistillationMethod):
                 do_sample=False,  # Greedy decoding for consistency
                 pad_token_id=self.tokenizer.pad_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
-                use_cache=True,  # Enable KV cache for faster generation
+                use_cache=False,  # Disable KV cache to lower peak GPU memory
                 num_beams=1  # Greedy decoding (no beam search overhead)
             )
             
@@ -589,13 +595,15 @@ class TokenAdaptiveKD(BaseDistillationMethod):
         
         # Generate teacher responses on-the-fly
         with torch.no_grad():
+            # Disable KV cache to reduce peak GPU memory during teacher generation.
             full_sequence = self.teacher_model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=self.max_new_tokens,
                 do_sample=False,
                 pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id
+                eos_token_id=self.tokenizer.eos_token_id,
+                use_cache=False  # Disable KV cache to lower peak GPU memory
             )
             
             prompt_length = input_ids.size(1)
@@ -792,6 +800,7 @@ class ChainOfThoughtDistillation(BaseDistillationMethod):
             
             # Generate teacher CoT responses on-the-fly (online distillation)
             with torch.no_grad():
+                # Disable KV cache to reduce peak GPU memory during teacher generation.
                 full_sequence = self.teacher_model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -799,7 +808,8 @@ class ChainOfThoughtDistillation(BaseDistillationMethod):
                     do_sample=do_sample,
                     temperature=temperature if do_sample else None,
                     pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    use_cache=False  # Disable KV cache to lower peak GPU memory
                 )
                 
                 # Calculate where prompt ends and response begins
@@ -958,13 +968,15 @@ class IntermediateFeatureMatching(BaseDistillationMethod):
         
         # Generate teacher responses
         with torch.no_grad():
+            # Disable KV cache to reduce peak GPU memory during teacher generation.
             full_sequence = self.teacher_model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=self.max_new_tokens,
                 do_sample=False,
                 pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id
+                eos_token_id=self.tokenizer.eos_token_id,
+                use_cache=False  # Disable KV cache to lower peak GPU memory
             )
             
             prompt_length = input_ids.size(1)
@@ -1137,13 +1149,15 @@ class AttentionDistillation(BaseDistillationMethod):
         
         # Generate teacher responses
         with torch.no_grad():
+            # Disable KV cache to reduce peak GPU memory during teacher generation.
             full_sequence = self.teacher_model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=self.max_new_tokens,
                 do_sample=False,
                 pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id
+                eos_token_id=self.tokenizer.eos_token_id,
+                use_cache=False  # Disable KV cache to lower peak GPU memory
             )
             
             prompt_length = input_ids.size(1)
