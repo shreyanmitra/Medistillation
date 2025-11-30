@@ -12,6 +12,8 @@ LEARNING_RATE = 1e-4
 
 ENABLE_CPU_OFFLOAD = True  # Disable CPU offload for better GPU utilization (RTX 5090 has 32GB VRAM)
 ALIGN_VOCABULARIES = True
+# Optional explicit per-GPU cap (GiB). If `None`, Trainer defaults to 20% of each GPU.
+MAX_GPU_MEM_GB = None
 
 METHODS_TO_RUN = [
     "sft",        # Baseline: Supervised Fine-Tuning
@@ -189,6 +191,10 @@ for method_idx, method in enumerate(METHODS_TO_RUN, 1):
 
     if ALIGN_VOCABULARIES:
         cmd += " \\\n        --align_vocabularies"
+
+    # If CPU offload is enabled and an explicit per-GPU cap is configured, pass it to Trainer
+    if ENABLE_CPU_OFFLOAD and MAX_GPU_MEM_GB is not None:
+        cmd += f" --max_gpu_mem_gb {MAX_GPU_MEM_GB}"
 
     # Add method-specific parameters
     method_params = method_info['params']

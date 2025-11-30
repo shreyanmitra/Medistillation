@@ -51,6 +51,8 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from tqdm import tqdm
+import tempfile
+import sys
 
 # Visualization imports
 import matplotlib
@@ -225,10 +227,48 @@ def setup_quantization_config(enable_cpu_offload: bool = False) -> BitsAndBytesC
     )
 
 
+def compute_max_memory_dict(per_gpu_limit_gb: Optional[float] = None, reserve_cpu_gb: int = 64) -> dict:
+    """
+    Compute a `max_memory` dictionary for HuggingFace `from_pretrained(..., max_memory=...)`.
+
+    - If `per_gpu_limit_gb` is provided, use that cap for each GPU (GiB).
+    - If `per_gpu_limit_gb` is None, default to 20% of each GPU's total memory.
+    - Always include a generous `cpu` bucket (reserve_cpu_gb + sum of GPU caps).
+
+    Returns a dict like {0: '28GiB', 1: '28GiB', 'cpu': '200GiB'}.
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return {"cpu": f"{reserve_cpu_gb}GiB"}
+
+        gpu_mems = []
+        for i in range(torch.cuda.device_count()):
+            prop = torch.cuda.get_device_properties(i)
+            total_gib = prop.total_memory / (1024 ** 3)
+            gpu_mems.append(total_gib)
+
+        max_memory = {}
+        for i, total_gib in enumerate(gpu_mems):
+            if per_gpu_limit_gb is None:
+                # Default: 20% of GPU to leave space for inference/other processes
+                allowed = max(int(total_gib * 0.2), 1)
+            else:
+                allowed = max(int(min(per_gpu_limit_gb, total_gib - 0.5)), 1)
+            max_memory[i] = f"{allowed}GiB"
+
+        cpu_gib = reserve_cpu_gb + sum(int(v) for v in gpu_mems)
+        max_memory["cpu"] = f"{cpu_gib}GiB"
+        return max_memory
+    except Exception:
+        return {"cpu": f"{reserve_cpu_gb}GiB"}
+
+
 def load_teacher_model(
     model_name: str,
     use_quantization: bool = True,
-    enable_cpu_offload: bool = False
+    enable_cpu_offload: bool = False,
+    max_gpu_mem_gb: Optional[float] = None
 ) -> nn.Module:
     """
     Load teacher model with optional quantization.
@@ -247,6 +287,15 @@ def load_teacher_model(
     if enable_cpu_offload:
         logger.info("CPU offloading ENABLED - model layers will overflow to CPU/RAM")
 
+    # Compute max_memory dict (enforces per-GPU hard cap). Default per-GPU cap is 20% if not provided.
+    max_memory = compute_max_memory_dict(per_gpu_limit_gb=max_gpu_mem_gb)
+    logger.info(f"Using max_memory device limits for teacher load: {max_memory}")
+
+    offload_folder = None
+    if enable_cpu_offload:
+        offload_folder = os.path.join(tempfile.gettempdir(), f"hf_offload_teacher_{os.getpid()}")
+        os.makedirs(offload_folder, exist_ok=True)
+
     if use_quantization:
         # Use 8-bit quantization to reduce memory footprint (QLoRA technique)
         # This allows loading large models (7B+ parameters) on consumer GPUs
@@ -258,6 +307,8 @@ def load_teacher_model(
                 model_name,
                 quantization_config=quantization_config,  # Apply 8-bit quantization
                 device_map="auto",  # Automatically distribute across available devices
+                max_memory=max_memory,
+                offload_folder=offload_folder,
                 trust_remote_code=True  # Allow custom model code from HuggingFace
             )
             _log_and_clear_cuda("after_teacher_from_pretrained")
@@ -277,6 +328,8 @@ def load_teacher_model(
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 device_map="auto",  # Automatically distribute across available devices
+                max_memory=max_memory,
+                offload_folder=offload_folder,
                 torch_dtype=torch.float16,  # Use half precision for memory efficiency
                 trust_remote_code=True
             )
@@ -328,7 +381,8 @@ def load_student_model(
     use_lora: bool = True,
     lora_config: Optional[Dict[str, Any]] = None,
     use_quantization: bool = True, 
-    enable_cpu_offload: bool = False
+    enable_cpu_offload: bool = False,
+    max_gpu_mem_gb: Optional[float] = None
 ) -> nn.Module:
     """
     Load student model with optional LoRA adapters.
@@ -351,6 +405,15 @@ def load_student_model(
     if enable_cpu_offload:
         logger.info("CPU offloading ENABLED for student model (llm_int8_enable_fp32_cpu_offload=True)")
 
+    # Compute max_memory dict (enforces per-GPU hard cap). Default per-GPU cap is 20% if not provided.
+    max_memory = compute_max_memory_dict(per_gpu_limit_gb=max_gpu_mem_gb)
+    logger.info(f"Using max_memory device limits for student load: {max_memory}")
+
+    offload_folder = None
+    if enable_cpu_offload:
+        offload_folder = os.path.join(tempfile.gettempdir(), f"hf_offload_student_{os.getpid()}")
+        os.makedirs(offload_folder, exist_ok=True)
+
     if use_quantization:
         # QLoRA: Quantize base model to 8-bit, add trainable LoRA adapters in FP16
         # This dramatically reduces memory usage while maintaining training quality
@@ -364,6 +427,8 @@ def load_student_model(
                 model_name,
                 quantization_config=quantization_config,  # Quantize frozen weights to 8-bit
                 device_map="auto",
+                max_memory=max_memory,
+                offload_folder=offload_folder,
                 trust_remote_code=True
             )
             _log_and_clear_cuda("after_student_from_pretrained")
@@ -386,6 +451,8 @@ def load_student_model(
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 device_map="auto",
+                max_memory=max_memory,
+                offload_folder=offload_folder,
                 torch_dtype=torch.float16,
                 trust_remote_code=True
             )
@@ -2822,6 +2889,9 @@ def main():
                         help='Use 8-bit quantization (QLoRA)')
     parser.add_argument('--enable_cpu_offload', action='store_true', default=False,
                         help='Enable CPU offloading for large teacher models (70B+)')
+    parser.add_argument('--max_gpu_mem_gb', type=float, default=None,
+                        help='Per-GPU hard limit in GiB; when set, loader will request device_map that keeps <= this on each GPU.\n'
+                             'Note: setting this option requires --enable_cpu_offload to be set for safety.')
     parser.add_argument('--resume_from_checkpoint', type=str, default='',
                         help='Path to checkpoint file to resume training from (optional)')
     parser.add_argument('--align_vocabularies', action='store_true', default=True,
@@ -2890,6 +2960,10 @@ def main():
 
     args = parser.parse_args()
 
+    # Validate: --max_gpu_mem_gb can only be set when --enable_cpu_offload is enabled
+    if args.max_gpu_mem_gb is not None and not args.enable_cpu_offload:
+        parser.error("--max_gpu_mem_gb requires --enable_cpu_offload to be set. This prevents accidental memory-only constraints without offload.")
+
     # Initialize config
     config = TrainingConfig(args)
 
@@ -2914,7 +2988,8 @@ def main():
     teacher_model = load_teacher_model(
         config.teacher_model_name,
         use_quantization=config.use_quantization,
-        enable_cpu_offload=config.enable_cpu_offload
+        enable_cpu_offload=config.enable_cpu_offload,
+        max_gpu_mem_gb=args.max_gpu_mem_gb
     )
 
     lora_config_dict = {
@@ -2931,7 +3006,8 @@ def main():
         use_lora=config.use_lora,
         lora_config=lora_config_dict,
         use_quantization=config.use_quantization,
-        enable_cpu_offload = config.enable_cpu_offload
+        enable_cpu_offload = config.enable_cpu_offload,
+        max_gpu_mem_gb=args.max_gpu_mem_gb
     )
 
     # ===== Vocabulary Alignment for Logit-Based Methods =====
