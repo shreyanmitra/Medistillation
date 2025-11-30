@@ -348,7 +348,7 @@ def load_teacher_model(
         try:
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                quantization_config=quantization_config,  # Apply 8-bit quantization
+                quantization_config=quantization_config,  # Apply 8-bit/4-bit quantization
                 device_map="auto",  # Automatically distribute across available devices
                 max_memory=max_memory,
                 offload_folder=offload_folder,
@@ -369,7 +369,40 @@ def load_teacher_model(
             except Exception:
                 logger.exception("Failed to run post-teacher-load diagnostics")
         except Exception as e:
+            # Detect meta-tensor errors that arise from low-memory 'meta' initialization
+            msg = str(e)
             logger.exception("Failed to load teacher model with from_pretrained(): %s", e)
+            if ("meta tensors" in msg) or ("Tensor.item() cannot be called on meta tensors" in msg):
+                logger.warning("Detected meta-tensor issue during 4-bit load; retrying with low_cpu_mem_usage=False to materialize tensors and avoid meta placeholders.")
+                try:
+                    model = AutoModelForCausalLM.from_pretrained(
+                        model_name,
+                        quantization_config=quantization_config,
+                        device_map="auto",
+                        max_memory=max_memory,
+                        offload_folder=offload_folder,
+                        trust_remote_code=True,
+                        low_cpu_mem_usage=False,
+                    )
+                    _log_and_clear_cuda("after_teacher_from_pretrained_retry_low_cpu_mem_usage")
+                    # proceed to diagnostics below
+                except Exception as e2:
+                    logger.exception("Retry with low_cpu_mem_usage=False also failed: %s", e2)
+                    try:
+                        if torch.cuda.is_available():
+                            logger.error("CUDA memory summary at teacher load failure:\n%s", torch.cuda.memory_summary(device=None, abbreviated=True))
+                            torch.cuda.empty_cache()
+                    except Exception as e3:
+                        logger.warning("Failed to capture CUDA memory summary after teacher load failure: %s", e3)
+                    raise
+            else:
+                try:
+                    if torch.cuda.is_available():
+                        logger.error("CUDA memory summary at teacher load failure:\n%s", torch.cuda.memory_summary(device=None, abbreviated=True))
+                        torch.cuda.empty_cache()
+                except Exception as e2:
+                    logger.warning("Failed to capture CUDA memory summary after teacher load failure: %s", e2)
+                raise
             try:
                 if torch.cuda.is_available():
                     logger.error("CUDA memory summary at teacher load failure:\n%s", torch.cuda.memory_summary(device=None, abbreviated=True))
@@ -519,14 +552,39 @@ def load_student_model(
             model = prepare_model_for_kbit_training(model)
             _log_and_clear_cuda("after_prepare_kbit")
         except Exception as e:
+            msg = str(e)
             logger.exception("Failed to load student model with from_pretrained() (quantized): %s", e)
-            try:
-                if torch.cuda.is_available():
-                    logger.error("CUDA memory summary at student quantized load failure:\n%s", torch.cuda.memory_summary(device=None, abbreviated=True))
-                    torch.cuda.empty_cache()
-            except Exception as e2:
-                logger.warning("Failed to capture CUDA memory summary after student quantized load failure: %s", e2)
-            raise
+            if ("meta tensors" in msg) or ("Tensor.item() cannot be called on meta tensors" in msg):
+                logger.warning("Detected meta-tensor issue during 4-bit load of student; retrying with low_cpu_mem_usage=False to materialize tensors and avoid meta placeholders.")
+                try:
+                    model = AutoModelForCausalLM.from_pretrained(
+                        model_name,
+                        quantization_config=quantization_config,
+                        device_map="auto",
+                        max_memory=max_memory,
+                        offload_folder=offload_folder,
+                        trust_remote_code=True,
+                        low_cpu_mem_usage=False,
+                    )
+                    _log_and_clear_cuda("after_student_from_pretrained_retry_low_cpu_mem_usage")
+                    # continue with prepare_model_for_kbit and diagnostics below
+                except Exception as e2:
+                    logger.exception("Retry with low_cpu_mem_usage=False for student also failed: %s", e2)
+                    try:
+                        if torch.cuda.is_available():
+                            logger.error("CUDA memory summary at student load failure:\n%s", torch.cuda.memory_summary(device=None, abbreviated=True))
+                            torch.cuda.empty_cache()
+                    except Exception as e3:
+                        logger.warning("Failed to capture CUDA memory summary after student load failure: %s", e3)
+                    raise
+            else:
+                try:
+                    if torch.cuda.is_available():
+                        logger.error("CUDA memory summary at student quantized load failure:\n%s", torch.cuda.memory_summary(device=None, abbreviated=True))
+                        torch.cuda.empty_cache()
+                except Exception as e2:
+                    logger.warning("Failed to capture CUDA memory summary after student quantized load failure: %s", e2)
+                raise
     else:
         # Standard loading in FP16 (no quantization)
         _log_and_clear_cuda("before_student_from_pretrained")
