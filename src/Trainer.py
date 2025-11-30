@@ -251,8 +251,8 @@ def compute_max_memory_dict(per_gpu_limit_gb: Optional[float] = None, reserve_cp
         max_memory = {}
         for i, total_gib in enumerate(gpu_mems):
             if per_gpu_limit_gb is None:
-                # Default: 20% of GPU to leave space for inference/other processes
-                allowed = max(int(total_gib * 0.2), 1)
+                # Default: 30% of GPU to leave space for inference/other processes
+                allowed = max(int(total_gib * 0.3), 1)
             else:
                 allowed = max(int(min(per_gpu_limit_gb, total_gib - 0.5)), 1)
             max_memory[i] = f"{allowed}GiB"

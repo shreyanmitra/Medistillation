@@ -2288,10 +2288,31 @@ def validate_tokenizer_compatibility(
     import logging
     logger = logging.getLogger(__name__)
     
-    # Get vocabulary sizes from models
-    teacher_vocab_size = teacher_model.config.vocab_size
-    student_vocab_size = student_model.config.vocab_size
+    # Robustly get vocabulary sizes from model config or tokenizer.
+    def _safe_get_vocab_size(model, tk=None):
+        cfg = getattr(model, 'config', None)
+        if cfg is not None:
+            for key in ('vocab_size', 'n_vocab'):
+                if hasattr(cfg, key):
+                    try:
+                        val = getattr(cfg, key)
+                        if isinstance(val, int) and val > 0:
+                            return val
+                    except Exception:
+                        pass
+        # Fall back to tokenizer if provided
+        if tk is not None:
+            try:
+                if hasattr(tk, 'vocab_size') and tk.vocab_size:
+                    return tk.vocab_size
+                return len(tk)
+            except Exception:
+                pass
+        return None
+
     tokenizer_vocab_size = len(tokenizer)
+    teacher_vocab_size = _safe_get_vocab_size(teacher_model, tokenizer) or tokenizer_vocab_size
+    student_vocab_size = _safe_get_vocab_size(student_model, tokenizer) or tokenizer_vocab_size
     
     # Check if vocab sizes match
     vocab_mismatch = teacher_vocab_size != student_vocab_size
