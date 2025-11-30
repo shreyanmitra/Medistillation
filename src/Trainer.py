@@ -424,18 +424,18 @@ def load_teacher_model(
             )
             _log_and_clear_cuda("after_teacher_from_pretrained")
         # Diagnostic: show hf_device_map and CUDA memory summary immediately after load
-        try:
-            import torch as _torch, pprint as _pprint, gc as _gc
-            print("hf_device_map present:", hasattr(model, "hf_device_map"))
-            if hasattr(model, "hf_device_map"):
-                _pprint.pprint(model.hf_device_map)
             try:
-                print(_torch.cuda.memory_summary(device=0, abbreviated=False))
+                import torch as _torch, pprint as _pprint, gc as _gc
+                print("hf_device_map present:", hasattr(model, "hf_device_map"))
+                if hasattr(model, "hf_device_map"):
+                    _pprint.pprint(model.hf_device_map)
+                try:
+                    print(_torch.cuda.memory_summary(device=0, abbreviated=False))
+                except Exception:
+                    print("Unable to fetch torch.cuda.memory_summary()")
+                _gc.collect()
             except Exception:
-                print("Unable to fetch torch.cuda.memory_summary()")
-            _gc.collect()
-        except Exception:
-            logger.exception("Failed to run post-teacher-load diagnostics")
+                logger.exception("Failed to run post-teacher-load diagnostics")
         except Exception as e:
             logger.exception("Failed to load teacher model (fp16) with from_pretrained(): %s", e)
             try:
@@ -598,19 +598,19 @@ def load_student_model(
                 trust_remote_code=True
             )
             _log_and_clear_cuda("after_student_from_pretrained")
-        # Diagnostic: show hf_device_map and CUDA memory summary immediately after load
-        try:
-            import torch as _torch, pprint as _pprint, gc as _gc
-            print("hf_device_map present:", hasattr(model, "hf_device_map"))
-            if hasattr(model, "hf_device_map"):
-                _pprint.pprint(model.hf_device_map)
+            # Diagnostic: show hf_device_map and CUDA memory summary immediately after load
             try:
-                print(_torch.cuda.memory_summary(device=0, abbreviated=False))
+                import torch as _torch, pprint as _pprint, gc as _gc
+                print("hf_device_map present:", hasattr(model, "hf_device_map"))
+                if hasattr(model, "hf_device_map"):
+                    _pprint.pprint(model.hf_device_map)
+                try:
+                    print(_torch.cuda.memory_summary(device=0, abbreviated=False))
+                except Exception:
+                    print("Unable to fetch torch.cuda.memory_summary()")
+                _gc.collect()
             except Exception:
-                print("Unable to fetch torch.cuda.memory_summary()")
-            _gc.collect()
-        except Exception:
-            logger.exception("Failed to run post-student-load diagnostics (fp16)")
+                logger.exception("Failed to run post-student-load diagnostics (fp16)")
         except Exception as e:
             logger.exception("Failed to load student model with from_pretrained() (fp16): %s", e)
             try:
