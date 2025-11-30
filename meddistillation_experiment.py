@@ -9,7 +9,7 @@ BASELINE_MODEL = "epfl-llm/meditron-7b"
 RUN_BASELINE = False
 
 NUM_EPOCHS = 3
-BATCH_SIZE = 8
+BATCH_SIZE = 64
 GRADIENT_ACCUMULATION = 1
 LEARNING_RATE = 1e-4 
 
@@ -18,6 +18,8 @@ ALIGN_VOCABULARIES = True
 # Optional explicit per-GPU cap (GiB). If `None`, Trainer defaults to 20% of each GPU.
 MAX_GPU_MEM_GB = None
 PREFER_4_BIT = False
+# Toggle to set CUDA_LAUNCH_BLOCKING=1 for deterministic CUDA errors/debugging
+ENABLE_CUDA_LAUNCH_BLOCKING = False
 
 METHODS_TO_RUN = [
     "sft",        # Baseline: Supervised Fine-Tuning
@@ -40,6 +42,7 @@ print(f"  • Gradient Accumulation: {GRADIENT_ACCUMULATION}")
 print(f"  • Effective Batch Size: {BATCH_SIZE * GRADIENT_ACCUMULATION}")
 print(f"  • Learning Rate: {LEARNING_RATE}")
 print(f"  • GPU: RTX 5090 (32GB VRAM)")
+print(f"  • CUDA Launch Blocking: {ENABLE_CUDA_LAUNCH_BLOCKING}")
 print(f"\n🔬 Methods: {', '.join(METHODS_TO_RUN)}")
 print(f"\n🎯 Research Goal:")
 print(f"  Demonstrate distillation matches direct fine-tuning at fraction of cost")
@@ -276,6 +279,9 @@ for method_idx, method in enumerate(METHODS_TO_RUN, 1):
     # Note: tqdm works best when output is a TTY, so we'll stream directly
     env = os.environ.copy()
     env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    # Optionally enable CUDA launch blocking to force synchronous CUDA errors
+    if ENABLE_CUDA_LAUNCH_BLOCKING:
+        env["CUDA_LAUNCH_BLOCKING"] = "1"
 
     # Prepare per-method launcher log directory
     launcher_dir = os.path.join(output_dir, "launcher_logs")
@@ -296,6 +302,7 @@ for method_idx, method in enumerate(METHODS_TO_RUN, 1):
             pass
         lf.write(f"COMMAND: {safe_cmd}\n")
         lf.write(f"PYTORCH_CUDA_ALLOC_CONF={env.get('PYTORCH_CUDA_ALLOC_CONF')}\n")
+        lf.write(f"CUDA_LAUNCH_BLOCKING={env.get('CUDA_LAUNCH_BLOCKING', '<unset>')}\n")
         # Capture nvidia-smi output if available
         try:
             nvs = subprocess.check_output(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu", "--format=csv,noheader,nounits"]) 

@@ -277,7 +277,7 @@ def compute_max_memory_dict(per_gpu_limit_gb: Optional[float] = None, reserve_cp
     Compute a `max_memory` dictionary for HuggingFace `from_pretrained(..., max_memory=...)`.
 
     - If `per_gpu_limit_gb` is provided, use that cap for each GPU (GiB).
-    - If `per_gpu_limit_gb` is None, default to 20% of each GPU's total memory.
+    - If `per_gpu_limit_gb` is None, default to 30% of each GPU's total memory.
     - Always include a generous `cpu` bucket (reserve_cpu_gb + sum of GPU caps).
 
     Returns a dict like {0: '28GiB', 1: '28GiB', 'cpu': '200GiB'}.
@@ -296,8 +296,8 @@ def compute_max_memory_dict(per_gpu_limit_gb: Optional[float] = None, reserve_cp
         max_memory = {}
         for i, total_gib in enumerate(gpu_mems):
             if per_gpu_limit_gb is None:
-                # Default: 20% of GPU to leave space for inference/other processes
-                allowed = max(int(total_gib * 0.2), 1)
+                # Default: 30% of GPU to leave space for inference/other processes
+                allowed = max(int(total_gib * 0.3), 1)
             else:
                 allowed = max(int(min(per_gpu_limit_gb, total_gib - 0.5)), 1)
             max_memory[i] = f"{allowed}GiB"
