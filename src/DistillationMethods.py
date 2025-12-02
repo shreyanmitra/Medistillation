@@ -466,7 +466,7 @@ class LogitKD(BaseDistillationMethod):
             # Disable KV cache to reduce peak GPU memory during teacher generation.
             # See comment above for rationale (prevents OOM with int8 kernels).
             # Use optimized generation settings for faster inference
-            full_sequence = self.teacher_model.generate(
+            teacher_generated_sequence = self.teacher_model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=self.max_new_tokens,
@@ -476,6 +476,25 @@ class LogitKD(BaseDistillationMethod):
                 use_cache=False,  # Disable KV cache to lower peak GPU memory
                 num_beams=1  # Greedy decoding (no beam search overhead)
             )
+            
+            # CRITICAL: Decode→re-tokenize to translate teacher vocab IDs to student vocab IDs
+            # Teacher's generate() uses its internal decoder → outputs teacher vocab IDs (up to 32006)
+            # Student embedding only has 32000 rows → must translate via text (universal representation)
+            batch_texts = self.tokenizer.batch_decode(
+                teacher_generated_sequence,
+                skip_special_tokens=False,  # Keep special tokens for proper reconstruction
+                clean_up_tokenization_spaces=False  # Preserve exact spacing
+            )
+            
+            # Re-tokenize with student tokenizer (guaranteed IDs < student vocab size)
+            re_tokenized = self.tokenizer(
+                batch_texts,
+                padding=True,
+                truncation=False,  # Don't truncate teacher's output
+                return_tensors='pt'
+            )
+            full_sequence = re_tokenized['input_ids'].to(self.get_device())
+            full_attention_mask = re_tokenized['attention_mask'].to(self.get_device())
             
             # Calculate where prompt ends and response begins
             prompt_length = input_ids.size(1)
@@ -488,16 +507,6 @@ class LogitKD(BaseDistillationMethod):
             # Store labels in batch for external inspection/logging
             batch['labels'] = labels
             
-            # Create attention mask for full sequence
-            full_attention_mask = torch.cat([
-                attention_mask,
-                torch.ones(
-                    (attention_mask.size(0), response_length),
-                    dtype=attention_mask.dtype,
-                    device=attention_mask.device
-                )
-            ], dim=1)
-            
             # Teacher forward pass on full sequence to get logits (this is the first difference from SFT's compute_loss)
             teacher_outputs = self.teacher_model(
                 input_ids=full_sequence,
@@ -505,6 +514,13 @@ class LogitKD(BaseDistillationMethod):
                 use_cache=True  # Enable KV cache
             )
             teacher_logits = teacher_outputs.logits
+        
+        # Clear CUDA cache after teacher generation to free up memory for student forward/backward pass
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # DEBUG: Validate token IDs before forward pass to catch CUDA errors early
+        check_token_ids(full_sequence, self.student_model, name="student_input_ids", verbose=True)
         
         # Student forward pass on full sequence. This returns logits only because we did not pass in labels. This is unlike in the SFT implementation, where we passed in labels and so both logits and labels were returned. We do this because it more efficient here to just calculate the cross-entropy loss manually. 
         student_outputs = self.student_model(
@@ -657,7 +673,7 @@ class TokenAdaptiveKD(BaseDistillationMethod):
         # Generate teacher responses on-the-fly
         with torch.no_grad():
             # Disable KV cache to reduce peak GPU memory during teacher generation.
-            full_sequence = self.teacher_model.generate(
+            teacher_generated_sequence = self.teacher_model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=self.max_new_tokens,
@@ -667,6 +683,22 @@ class TokenAdaptiveKD(BaseDistillationMethod):
                 use_cache=False  # Disable KV cache to lower peak GPU memory
             )
             
+            # CRITICAL: Decode→re-tokenize to translate teacher vocab IDs to student vocab IDs
+            batch_texts = self.tokenizer.batch_decode(
+                teacher_generated_sequence,
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False
+            )
+            
+            re_tokenized = self.tokenizer(
+                batch_texts,
+                padding=True,
+                truncation=False,
+                return_tensors='pt'
+            )
+            full_sequence = re_tokenized['input_ids'].to(self.get_device())
+            full_attention_mask = re_tokenized['attention_mask'].to(self.get_device())
+            
             prompt_length = input_ids.size(1)
             response_length = full_sequence.size(1) - prompt_length
             
@@ -674,21 +706,19 @@ class TokenAdaptiveKD(BaseDistillationMethod):
             labels[:, prompt_length:] = full_sequence[:, prompt_length:]
             batch['labels'] = labels
             
-            full_attention_mask = torch.cat([
-                attention_mask,
-                torch.ones(
-                    (attention_mask.size(0), response_length),
-                    dtype=attention_mask.dtype,
-                    device=attention_mask.device
-                )
-            ], dim=1)
-            
             # Teacher forward pass
             teacher_outputs = self.teacher_model(
                 input_ids=full_sequence,
                 attention_mask=full_attention_mask
             )
             teacher_logits = teacher_outputs.logits
+        
+        # Clear CUDA cache after teacher generation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # DEBUG: Validate token IDs before forward pass
+        check_token_ids(full_sequence, self.student_model, name="student_input_ids", verbose=True)
         
         # Student forward pass
         student_outputs = self.student_model(
@@ -862,7 +892,7 @@ class ChainOfThoughtDistillation(BaseDistillationMethod):
             # Generate teacher CoT responses on-the-fly (online distillation)
             with torch.no_grad():
                 # Disable KV cache to reduce peak GPU memory during teacher generation.
-                full_sequence = self.teacher_model.generate(
+                teacher_generated_sequence = self.teacher_model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     max_new_tokens=self.max_new_tokens,
@@ -872,6 +902,22 @@ class ChainOfThoughtDistillation(BaseDistillationMethod):
                     eos_token_id=self.tokenizer.eos_token_id,
                     use_cache=False  # Disable KV cache to lower peak GPU memory
                 )
+                
+                # CRITICAL: Decode→re-tokenize to translate teacher vocab IDs to student vocab IDs
+                batch_texts = self.tokenizer.batch_decode(
+                    teacher_generated_sequence,
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False
+                )
+                
+                re_tokenized = self.tokenizer(
+                    batch_texts,
+                    padding=True,
+                    truncation=False,
+                    return_tensors='pt'
+                )
+                full_sequence = re_tokenized['input_ids'].to(self.get_device())
+                full_attention_mask = re_tokenized['attention_mask'].to(self.get_device())
                 
                 # Calculate where prompt ends and response begins
                 prompt_length = input_ids.size(1)
@@ -884,16 +930,13 @@ class ChainOfThoughtDistillation(BaseDistillationMethod):
                 # Store labels from first rationale in batch for external inspection/logging
                 if rationale_idx == 0:
                     batch['labels'] = labels
-                
-                # Create attention mask for full sequence (preserve original padding info)
-                full_attention_mask = torch.cat([
-                    attention_mask,  # Preserve original prompt mask (including padding)
-                    torch.ones(
-                        (attention_mask.size(0), response_length),
-                        dtype=attention_mask.dtype,
-                        device=attention_mask.device
-                    )  # All 1s for generated tokens (no padding in generation)
-                ], dim=1)
+            
+            # Clear CUDA cache after teacher generation
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # DEBUG: Validate token IDs before forward pass
+            check_token_ids(full_sequence, self.student_model, name="student_input_ids", verbose=True)
             
             # Student forward pass with teacher-generated CoT labels gives us logits and loss
             student_outputs = self.student_model(
@@ -2203,7 +2246,7 @@ class SPINDistillation(BaseRLDistillationMethod):
         attention_mask_teacher = inputs_teacher['attention_mask'].to(self.get_device())
         
         with torch.no_grad():  # Teacher doesn't get trained
-            teacher_full = self.teacher_model.generate(
+            teacher_generated = self.teacher_model.generate(
                 input_ids=input_ids_teacher,
                 attention_mask=attention_mask_teacher,
                 max_new_tokens=self.max_new_tokens,
@@ -2211,6 +2254,25 @@ class SPINDistillation(BaseRLDistillationMethod):
                 pad_token_id=self.tokenizer.pad_token_id,
                 eos_token_id=self.tokenizer.eos_token_id
             )
+            
+            # CRITICAL: Decode→re-tokenize to translate teacher vocab IDs to student vocab IDs
+            batch_texts = self.tokenizer.batch_decode(
+                teacher_generated,
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False
+            )
+            
+            re_tokenized = self.tokenizer(
+                batch_texts,
+                padding=True,
+                truncation=False,
+                return_tensors='pt'
+            )
+            teacher_full = re_tokenized['input_ids'].to(self.get_device())
+        
+        # Clear CUDA cache after teacher generation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         # Extract teacher's generated portion (remove prompt)
         teacher_sequences = teacher_full[:, input_ids_teacher.size(1):]
