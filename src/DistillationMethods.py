@@ -29,6 +29,47 @@ TokenizerType = Union[PreTrainedTokenizer, PreTrainedTokenizerFast]
 
 
 # ==============================================================================
+# DEBUG HELPER - Token ID Validation
+# ==============================================================================
+
+def check_token_ids(input_ids: torch.Tensor, model: nn.Module, name: str = "input_ids", verbose: bool = True):
+    """
+    Validate that token IDs are within valid range for model's embedding layer.
+    
+    This catches the exact cause of CUDA "vectorized_gather_kernel" index out-of-bounds errors
+    by checking BEFORE the forward pass instead of inside CUDA kernels.
+    
+    :param input_ids: Token IDs tensor to validate
+    :type input_ids: torch.Tensor
+    :param model: Model to check embedding size against
+    :type model: nn.Module
+    :param name: Name for debug output (e.g., "student_input_ids")
+    :type name: str
+    :param verbose: Whether to print debug info
+    :type verbose: bool
+    :raises AssertionError: If token IDs are out of valid range
+    """
+    emb = model.get_input_embeddings()
+    vocab_size = emb.num_embeddings
+    min_id = input_ids.min().item()
+    max_id = input_ids.max().item()
+    
+    if verbose:
+        print(f"[DEBUG CHECK] {name}: shape={tuple(input_ids.shape)}, min={min_id}, max={max_id}, vocab_size={vocab_size}")
+    
+    # Strong guards - will fire BEFORE CUDA error with clear message
+    assert min_id >= 0, (
+        f"Found negative token ID in {name}: min={min_id}. "
+        f"Negative IDs (like -1 or -100) should only be in labels, never in input_ids."
+    )
+    assert max_id < vocab_size, (
+        f"Found token ID >= vocab_size in {name}: max={max_id}, vocab_size={vocab_size}. "
+        f"This means some token IDs exceed the model's embedding table size. "
+        f"Check: (1) tokenizer used matches vocab alignment, (2) vocab alignment completed successfully."
+    )
+
+
+# ==============================================================================
 # ABSTRACT BASE CLASS - The Template for All Distillation Methods
 # ==============================================================================
 
@@ -288,6 +329,9 @@ class StandardSFT(BaseDistillationMethod):
                     device=attention_mask.device
                 )  # All 1s for generated tokens (no padding in generation)
             ], dim=1)
+        
+        # DEBUG: Validate token IDs before forward pass to catch CUDA errors early
+        check_token_ids(full_sequence, self.student_model, name="student_input_ids", verbose=True)
         
         # Student forward pass with teacher-generated labels gives us logits and loss
         student_outputs = self.student_model(
@@ -2473,6 +2517,34 @@ def align_student_vocabulary_to_teacher(
     logger.info(f"   Student vocab: {len(student_tokenizer):,}")
     match = len(teacher_tokenizer) == len(student_tokenizer)
     logger.info(f"   Match: {'✅ YES' if match else '❌ NO'}")
+    
+    # Post-alignment sanity checks (catch issues BEFORE training)
+    logger.info(f"\n🔍 POST-ALIGNMENT SANITY CHECKS:")
+    teacher_ids = list(teacher_tokenizer.get_vocab().values())
+    student_ids = list(student_tokenizer.get_vocab().values())
+    
+    logger.info(f"   Teacher max token ID: {max(teacher_ids):,}")
+    logger.info(f"   Student max token ID: {max(student_ids):,}")
+    logger.info(f"   Teacher len(tokenizer): {len(teacher_tokenizer):,}")
+    logger.info(f"   Student len(tokenizer): {len(student_tokenizer):,}")
+    
+    student_emb_size = student_model.get_input_embeddings().num_embeddings
+    logger.info(f"   Student embedding size: {student_emb_size:,}")
+    
+    # Critical check: embedding size must match tokenizer vocab size
+    if student_emb_size != len(student_tokenizer):
+        logger.warning(f"   ⚠️  WARNING: Embedding size ({student_emb_size:,}) != tokenizer vocab ({len(student_tokenizer):,})")
+        logger.warning(f"   This may cause index out-of-bounds errors during training!")
+    else:
+        logger.info(f"   ✅ Embedding size matches tokenizer vocab")
+    
+    # Check that max token IDs are within bounds
+    if max(student_ids) >= student_emb_size:
+        logger.error(f"   ❌ ERROR: Max student token ID ({max(student_ids):,}) >= embedding size ({student_emb_size:,})")
+        logger.error(f"   This WILL cause CUDA errors during training!")
+    else:
+        logger.info(f"   ✅ All token IDs within embedding range")
+    
     logger.info("="*60)
     
     return student_model, student_tokenizer
