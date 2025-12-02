@@ -209,19 +209,20 @@ for method_idx, method in enumerate(METHODS_TO_RUN, 1):
     if PREFER_4_BIT:
         cmd += " \\\n        --prefer_4bit"
 
-        # Pass sampling args to Trainer when requested by this launcher
-        if MAX_TRAIN_SAMPLES_PER_EPOCH:
-            cmd += f" \\\n        --max_train_samples_per_epoch {MAX_TRAIN_SAMPLES_PER_EPOCH}"
-            # Pass sampling seed (helps reproducibility)
-            cmd += f" \\\n        --sampling_seed {SAMPLING_SEED}"
-        if RESAMPLE_TRAIN_SAMPLES_EACH_EPOCH:
-            cmd += " \\\n        --resample_train_samples_each_epoch"
+    # Pass sampling args to Trainer when requested by this launcher
+    if MAX_TRAIN_SAMPLES_PER_EPOCH:
+        cmd += f" \\\n        --max_train_samples_per_epoch {MAX_TRAIN_SAMPLES_PER_EPOCH}"
+        # Pass sampling seed (helps reproducibility)
+        cmd += f" \\\n        --sampling_seed {SAMPLING_SEED}"
+    if RESAMPLE_TRAIN_SAMPLES_EACH_EPOCH:
+        cmd += " \\\n        --resample_train_samples_each_epoch"
+    
     # Pass baseline args to Trainer when requested by this launcher
     if RUN_BASELINE:
         # If a baseline model ID is provided, pass it; otherwise Trainer will skip if empty
         if BASELINE_MODEL:
-            cmd += f" \\\n+        --baseline_model {BASELINE_MODEL}"
-        cmd += " \\\n+        --run_baseline"
+            cmd += f" \\\n        --baseline_model {BASELINE_MODEL}"
+        cmd += " \\\n        --run_baseline"
 
     # If CPU offload is enabled and an explicit per-GPU cap is configured, pass it to Trainer
     if ENABLE_CPU_OFFLOAD and MAX_GPU_MEM_GB is not None:
