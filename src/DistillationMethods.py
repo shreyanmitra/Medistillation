@@ -291,6 +291,10 @@ class StandardSFT(BaseDistillationMethod):
         input_ids = batch['input_ids']
         attention_mask = batch['attention_mask']
         
+        # CRITICAL: For cross-tokenizer distillation (e.g., Meditron → TinyLlama),
+        # teacher generates token IDs from ITS vocabulary, which may exceed student's vocab size.
+        # Solution: Decode teacher output to text, then re-tokenize with student tokenizer.
+        
         # Generate teacher responses on-the-fly (online distillation)
         # Use inference_mode instead of no_grad for better performance
         with torch.inference_mode():
@@ -298,7 +302,7 @@ class StandardSFT(BaseDistillationMethod):
             # This prevents large KV-cache allocations + temporary int32 buffers
             # (e.g., from bitsandbytes int8 kernels) from causing OOMs when
             # the trainer already consumes most GPU memory.
-            full_sequence = self.teacher_model.generate(
+            teacher_generated_sequence = self.teacher_model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=self.max_new_tokens,
@@ -309,26 +313,34 @@ class StandardSFT(BaseDistillationMethod):
                 num_beams=1  # Greedy decoding (no beam search overhead)
             )
             
+            # Decode teacher output to text (works for any teacher vocab size)
+            batch_texts = self.tokenizer.batch_decode(teacher_generated_sequence, skip_special_tokens=False)
+            
+            # Re-tokenize with student tokenizer to ensure token IDs are within student vocab
+            # This handles the case where teacher has extra tokens (e.g., medical terminology)
+            re_tokenized = self.tokenizer(
+                batch_texts,
+                return_tensors='pt',
+                padding=True,
+                truncation=True,
+                max_length=teacher_generated_sequence.size(1),  # Match teacher length
+            ).to(input_ids.device)
+            
+            full_sequence = re_tokenized['input_ids']
+            full_attention_mask = re_tokenized['attention_mask']
+            
             # Calculate where prompt ends and response begins
+            # We need to find the actual prompt length in the re-tokenized sequence
+            # For now, use the original input_ids length as approximate boundary
             prompt_length = input_ids.size(1)
-            response_length = full_sequence.size(1) - prompt_length
             
             # Create labels: -100 for prompt tokens (ignored in loss), actual tokens for response
             labels = torch.full_like(full_sequence, -100)
-            labels[:, prompt_length:] = full_sequence[:, prompt_length:]
+            if full_sequence.size(1) > prompt_length:
+                labels[:, prompt_length:] = full_sequence[:, prompt_length:]
             
             # Store labels in batch for external inspection/logging
             batch['labels'] = labels
-            
-            # Create attention mask for full sequence (preserve original padding info)
-            full_attention_mask = torch.cat([
-                attention_mask,  # Preserve original prompt mask (including padding)
-                torch.ones(
-                    (attention_mask.size(0), response_length),
-                    dtype=attention_mask.dtype,
-                    device=attention_mask.device
-                )  # All 1s for generated tokens (no padding in generation)
-            ], dim=1)
         
         # DEBUG: Validate token IDs before forward pass to catch CUDA errors early
         check_token_ids(full_sequence, self.student_model, name="student_input_ids", verbose=True)
@@ -347,7 +359,7 @@ class StandardSFT(BaseDistillationMethod):
         metrics = {
             'ce_loss': loss.detach().item(),
             'total_loss': loss.detach().item(),
-            'avg_response_length': float(response_length)
+            'avg_response_length': float(full_sequence.size(1) - prompt_length)
         }
         
         return loss, metrics
@@ -2545,6 +2557,23 @@ def align_student_vocabulary_to_teacher(
     else:
         logger.info(f"   ✅ All token IDs within embedding range")
     
+    # CRITICAL: Check if tokenizers are TRULY aligned
+    teacher_special_tokens = set(teacher_tokenizer.all_special_tokens)
+    student_special_tokens = set(student_tokenizer.all_special_tokens)
+    logger.info(f"\n🔍 SPECIAL TOKENS CHECK:")
+    logger.info(f"   Teacher special tokens: {sorted(teacher_special_tokens)}")
+    logger.info(f"   Student special tokens: {sorted(student_special_tokens)}")
+    
+    if teacher_special_tokens != student_special_tokens:
+        logger.warning(f"   ⚠️  WARNING: Special tokens differ between teacher and student!")
+        logger.warning(f"   Extra in teacher: {teacher_special_tokens - student_special_tokens}")
+        logger.warning(f"   Extra in student: {student_special_tokens - teacher_special_tokens}")
+    
+    logger.info("="*60)
+    
+    logger.info(f"\n⚠️  CRITICAL: Return the STUDENT tokenizer for dataloader creation!")
+    logger.info(f"   The returned tokenizer (id={id(student_tokenizer)}) MUST be used for data tokenization")
+    logger.info(f"   DO NOT create a new tokenizer or reload from HuggingFace!")
     logger.info("="*60)
     
     return student_model, student_tokenizer

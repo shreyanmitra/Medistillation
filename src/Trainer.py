@@ -3447,6 +3447,9 @@ def main():
     # ===== Create Dataloaders =====
     # Load training and validation data, create batches with proper padding
     logger.info("Creating dataloaders...")
+    logger.info(f"🔍 Tokenizer being passed to dataloader: len={len(tokenizer)}, id={id(tokenizer)}")
+    logger.info(f"   Max possible token ID from this tokenizer: {len(tokenizer) - 1}")
+    
     train_dataloader, val_dataloader = create_train_val_dataloaders(
         train_path=config.train_data_path,
         val_path=config.val_data_path,
