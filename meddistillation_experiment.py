@@ -9,8 +9,8 @@ BASELINE_MODEL = "epfl-llm/meditron-7b"
 RUN_BASELINE = False
 
 NUM_EPOCHS = 3
-BATCH_SIZE = 64
-GRADIENT_ACCUMULATION = 1
+BATCH_SIZE = 16
+GRADIENT_ACCUMULATION = 4
 LEARNING_RATE = 1e-4 
 
 ENABLE_CPU_OFFLOAD = True  # Disable CPU offload for better GPU utilization (RTX 5090 has 32GB VRAM)
@@ -196,7 +196,7 @@ for method_idx, method in enumerate(METHODS_TO_RUN, 1):
         --batch_size {BATCH_SIZE} \\
         --gradient_accumulation_steps {GRADIENT_ACCUMULATION} \\
         --learning_rate {LEARNING_RATE} \\
-        --max_length 1024 \\
+        --max_length 512 \\
         --num_workers 16 \\
         --output_dir {output_dir}"""
 

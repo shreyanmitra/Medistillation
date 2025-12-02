@@ -659,6 +659,17 @@ def load_student_model(
                 logger.warning("Failed to capture CUDA memory summary after student fp16 load failure: %s", e2)
             raise
 
+    # Enable gradient checkpointing to reduce memory usage during backward pass
+    # This trades compute for memory by recomputing activations instead of storing them
+    if hasattr(model, 'gradient_checkpointing_enable'):
+        try:
+            model.gradient_checkpointing_enable()
+            logger.info("✅ Gradient checkpointing enabled for student model (reduces memory usage)")
+        except Exception as e:
+            logger.warning(f"⚠️  Failed to enable gradient checkpointing: {e}")
+    else:
+        logger.warning("⚠️  Model does not support gradient checkpointing")
+    
     if use_lora:
         logger.info("Applying LoRA adapters")
         # LoRA (Low-Rank Adaptation): Add small trainable matrices to frozen model

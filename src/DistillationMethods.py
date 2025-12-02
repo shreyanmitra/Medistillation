@@ -342,6 +342,11 @@ class StandardSFT(BaseDistillationMethod):
             # Store labels in batch for external inspection/logging
             batch['labels'] = labels
         
+        # Clear CUDA cache after teacher generation to free up memory for student forward/backward pass
+        # Teacher generation can leave large temporary allocations that aren't needed anymore
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         # DEBUG: Validate token IDs before forward pass to catch CUDA errors early
         check_token_ids(full_sequence, self.student_model, name="student_input_ids", verbose=True)
         
