@@ -783,6 +783,20 @@ class Trainer:
         self._initial_num_workers = config.num_workers
         self._initial_pin_memory = True if torch.cuda.is_available() else False
 
+        self.global_step = 0
+        self.best_val_loss = float('inf')
+        self.training_history = {
+            'train_loss': [],
+            'val_loss': [],
+            'learning_rate': []
+        }
+
+        # Computational cost tracking
+        self.start_time = None
+        self.total_training_time = 0.0  # Wall-clock seconds
+        self.peak_memory_allocated = 0.0  # Peak GPU memory in GB
+        self.peak_memory_reserved = 0.0  # Peak GPU memory reserved in GB
+
     def _maybe_refresh_train_dataloader(self, epoch: int):
         """
         If per-epoch resampling is enabled, rebuild `self.train_dataloader` for the given epoch.
@@ -829,19 +843,7 @@ class Trainer:
             # Fixed sampled dataloader case is handled earlier in main() where train_dataloader was replaced.
             return
 
-        self.global_step = 0
-        self.best_val_loss = float('inf')
-        self.training_history = {
-            'train_loss': [],
-            'val_loss': [],
-            'learning_rate': []
-        }
-
-        # Computational cost tracking
-        self.start_time = None
-        self.total_training_time = 0.0  # Wall-clock seconds
-        self.peak_memory_allocated = 0.0  # Peak GPU memory in GB
-        self.peak_memory_reserved = 0.0  # Peak GPU memory reserved in GB
+        
 
     def train(self):
         """Main training loop."""
