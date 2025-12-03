@@ -205,6 +205,16 @@ class TrainingConfig:
             self.max_train_samples_per_epoch_raw = 0
         self.resample_train_samples_each_epoch: bool = getattr(args, 'resample_train_samples_each_epoch', False)
         self.sampling_seed: int = getattr(args, 'sampling_seed', 42)
+        
+        # Validation sampling (same format as train)
+        self.max_val_samples_raw = getattr(args, 'max_val_samples', 0)
+        if self.max_val_samples_raw is None:
+            self.max_val_samples_raw = 0
+        
+        # Test sampling (same format as train)
+        self.max_test_samples_raw = getattr(args, 'max_test_samples', 0)
+        if self.max_test_samples_raw is None:
+            self.max_test_samples_raw = 0
 
     def resolve_max_train_samples(self, dataset_len: int) -> Optional[int]:
         """Resolve the raw `max_train_samples_per_epoch_raw` into an integer sample size.
@@ -225,6 +235,106 @@ class TrainingConfig:
         # Fractional case (proportion of dataset)
         if 0 < val <= 1.0:
             # floor to integer but ensure at least 1
+            count = max(1, int(math.floor(val * float(dataset_len))))
+            return min(count, dataset_len)
+
+        # Absolute count case
+        count = int(math.floor(val))
+        return min(max(1, count), dataset_len)
+    
+    def resolve_max_val_samples(self, dataset_len: int) -> Optional[int]:
+        """Resolve the raw `max_val_samples_raw` into an integer sample size.
+
+        - If raw is 0 or None -> returns None (no sampling)
+        - If 0 < raw <= 1.0 -> treat as fraction of dataset_len (floor), at least 1
+        - If raw > 1 -> treat as absolute sample count (clamped to dataset_len)
+        """
+        raw = self.max_val_samples_raw
+        try:
+            val = float(raw)
+        except Exception:
+            return None
+
+        if val <= 0:
+            return None
+
+        # Fractional case (proportion of dataset)
+        if 0 < val <= 1.0:
+            count = max(1, int(math.floor(val * float(dataset_len))))
+            return min(count, dataset_len)
+
+        # Absolute count case
+        count = int(math.floor(val))
+        return min(max(1, count), dataset_len)
+    
+    def resolve_max_test_samples(self, dataset_len: int) -> Optional[int]:
+        """Resolve the raw `max_test_samples_raw` into an integer sample size.
+
+        - If raw is 0 or None -> returns None (no sampling)
+        - If 0 < raw <= 1.0 -> treat as fraction of dataset_len (floor), at least 1
+        - If raw > 1 -> treat as absolute sample count (clamped to dataset_len)
+        """
+        raw = self.max_test_samples_raw
+        try:
+            val = float(raw)
+        except Exception:
+            return None
+
+        if val <= 0:
+            return None
+
+        # Fractional case (proportion of dataset)
+        if 0 < val <= 1.0:
+            count = max(1, int(math.floor(val * float(dataset_len))))
+            return min(count, dataset_len)
+
+        # Absolute count case
+        count = int(math.floor(val))
+        return min(max(1, count), dataset_len)
+    
+    def resolve_max_val_samples(self, dataset_len: int) -> Optional[int]:
+        """Resolve the raw `max_val_samples_raw` into an integer sample size.
+
+        - If raw is 0 or None -> returns None (no sampling)
+        - If 0 < raw <= 1.0 -> treat as fraction of dataset_len (floor), at least 1
+        - If raw > 1 -> treat as absolute sample count (clamped to dataset_len)
+        """
+        raw = self.max_val_samples_raw
+        try:
+            val = float(raw)
+        except Exception:
+            return None
+
+        if val <= 0:
+            return None
+
+        # Fractional case (proportion of dataset)
+        if 0 < val <= 1.0:
+            count = max(1, int(math.floor(val * float(dataset_len))))
+            return min(count, dataset_len)
+
+        # Absolute count case
+        count = int(math.floor(val))
+        return min(max(1, count), dataset_len)
+    
+    def resolve_max_test_samples(self, dataset_len: int) -> Optional[int]:
+        """Resolve the raw `max_test_samples_raw` into an integer sample size.
+
+        - If raw is 0 or None -> returns None (no sampling)
+        - If 0 < raw <= 1.0 -> treat as fraction of dataset_len (floor), at least 1
+        - If raw > 1 -> treat as absolute sample count (clamped to dataset_len)
+        """
+        raw = self.max_test_samples_raw
+        try:
+            val = float(raw)
+        except Exception:
+            return None
+
+        if val <= 0:
+            return None
+
+        # Fractional case (proportion of dataset)
+        if 0 < val <= 1.0:
             count = max(1, int(math.floor(val * float(dataset_len))))
             return min(count, dataset_len)
 
@@ -3232,6 +3342,14 @@ def main():
                               '(e.g. 0.1 for 10% of dataset). 0 or omitted means no sampling.'))
     parser.add_argument('--resample_train_samples_each_epoch', action='store_true', default=False,
                         help='If set, resample the subset of training examples each epoch (otherwise the subset is fixed once).')
+    parser.add_argument('--max_val_samples', type=float, default=0,
+                        help=('If >0, limit the number of validation examples. ' 
+                              'Accepts an absolute integer (e.g. 1000) or a fraction in (0,1] ' 
+                              '(e.g. 0.1 for 10% of dataset). 0 or omitted means no sampling.'))
+    parser.add_argument('--max_test_samples', type=float, default=0,
+                        help=('If >0, limit the number of test examples for benchmark evaluation. ' 
+                              'Accepts an absolute integer (e.g. 500) or a fraction in (0,1] ' 
+                              '(e.g. 0.1 for 10% of dataset). 0 or omitted means no sampling.'))
     parser.add_argument('--sampling_seed', type=int, default=42,
                         help='Base RNG seed used for deterministic per-epoch resampling when enabled.')
 
@@ -3523,6 +3641,40 @@ def main():
             logger.warning(f"Failed to create fixed sampled dataloader: {e}")
     elif resolved_max is not None and config.resample_train_samples_each_epoch:
         logger.info(f"Will resample {resolved_max} training examples each epoch (seed={config.sampling_seed})")
+    
+    # ===== Validation Sampling (if requested) =====
+    try:
+        val_dataset_len = len(val_dataloader.dataset)
+    except Exception:
+        val_dataset_len = None
+    
+    if val_dataset_len is not None:
+        resolved_val_max = config.resolve_max_val_samples(val_dataset_len)
+        if resolved_val_max is not None:
+            logger.info(f"Sampling validation set: {resolved_val_max} examples (seed={config.sampling_seed})")
+            try:
+                import numpy as _np
+                rng = _np.random.RandomState(config.sampling_seed)
+                val_indices = rng.choice(val_dataset_len, size=int(resolved_val_max), replace=False)
+                from torch.utils.data import Subset
+                sampled_val_dataset = Subset(val_dataloader.dataset, val_indices.tolist())
+
+                # Recreate validation dataloader
+                sampled_val_dataloader = DataLoader(
+                    sampled_val_dataset,
+                    batch_size=config.batch_size,
+                    shuffle=False,  # Don't shuffle validation
+                    num_workers=config.num_workers,
+                    collate_fn=getattr(val_dataloader, 'collate_fn', None),
+                    pin_memory=True if torch.cuda.is_available() else False,
+                    persistent_workers=True if config.num_workers > 0 else False,
+                    prefetch_factor=2 if config.num_workers > 0 else None,
+                    drop_last=False
+                )
+                val_dataloader = sampled_val_dataloader
+                logger.info(f"Created sampled validation dataloader with {len(sampled_val_dataset)} examples ({len(val_dataloader)} batches)")
+            except Exception as e:
+                logger.warning(f"Failed to create sampled validation dataloader: {e}")
 
 
     # ===== Setup Optimizer =====

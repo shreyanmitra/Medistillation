@@ -25,6 +25,9 @@ ENABLE_CUDA_LAUNCH_BLOCKING = True
 MAX_TRAIN_SAMPLES_PER_EPOCH = 5000
 # If True, resample the subset each epoch (deterministic with SAMPLING_SEED)
 RESAMPLE_TRAIN_SAMPLES_EACH_EPOCH = True
+# Validation and test sampling (same format as train)
+MAX_VAL_SAMPLES = 1000  # 0 to disable, or fraction like 0.1 for 10%
+MAX_TEST_SAMPLES = 500  # 0 to disable, or fraction like 0.1 for 10%
 # Base seed for deterministic per-epoch resampling
 SAMPLING_SEED = 42
 
@@ -216,6 +219,12 @@ for method_idx, method in enumerate(METHODS_TO_RUN, 1):
         cmd += f" \\\n        --sampling_seed {SAMPLING_SEED}"
     if RESAMPLE_TRAIN_SAMPLES_EACH_EPOCH:
         cmd += " \\\n        --resample_train_samples_each_epoch"
+    
+    # Pass validation and test sampling args
+    if MAX_VAL_SAMPLES:
+        cmd += f" \\\n        --max_val_samples {MAX_VAL_SAMPLES}"
+    if MAX_TEST_SAMPLES:
+        cmd += f" \\\n        --max_test_samples {MAX_TEST_SAMPLES}"
     
     # Pass baseline args to Trainer when requested by this launcher
     if RUN_BASELINE:
