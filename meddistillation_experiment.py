@@ -8,9 +8,9 @@ BASELINE_MODEL = "epfl-llm/meditron-7b"
 # Set to True to pass --baseline_model and --run_baseline to Trainer
 RUN_BASELINE = False
 
-NUM_EPOCHS = 3
-BATCH_SIZE = 16
-GRADIENT_ACCUMULATION = 4
+NUM_EPOCHS = 15
+BATCH_SIZE = 2
+GRADIENT_ACCUMULATION = 2
 LEARNING_RATE = 1e-4 
 
 ENABLE_CPU_OFFLOAD = True  # Disable CPU offload for better GPU utilization (RTX 5090 has 32GB VRAM)
@@ -22,12 +22,12 @@ PREFER_4_BIT = False
 ENABLE_CUDA_LAUNCH_BLOCKING = True
 
 # Sampling control: integer (e.g. 20000) or fraction (e.g. 0.05 for 5% of dataset). 0 disables sampling.
-MAX_TRAIN_SAMPLES_PER_EPOCH = 5000
+MAX_TRAIN_SAMPLES_PER_EPOCH = 64
 # If True, resample the subset each epoch (deterministic with SAMPLING_SEED)
 RESAMPLE_TRAIN_SAMPLES_EACH_EPOCH = True
 # Validation and test sampling (same format as train)
-MAX_VAL_SAMPLES = 1000  # 0 to disable, or fraction like 0.1 for 10%
-MAX_TEST_SAMPLES = 500  # 0 to disable, or fraction like 0.1 for 10%
+MAX_VAL_SAMPLES = 4  # 0 to disable, or fraction like 0.1 for 10%
+MAX_TEST_SAMPLES = 4  # 0 to disable, or fraction like 0.1 for 10%
 # Base seed for deterministic per-epoch resampling
 SAMPLING_SEED = 42
 

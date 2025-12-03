@@ -38,6 +38,7 @@ venv/
 env/
 ENV/
 .conda/
+myenv/
 
 # IDE and editors
 .vscode/
